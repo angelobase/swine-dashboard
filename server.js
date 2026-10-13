@@ -25,6 +25,27 @@ const reg = {
 };
 for (const r of reg.all.all()) if (!PENS.includes(r.pen_id)) PENS.push(r.pen_id);
 
+// ---- Prototype device channel: state, events and remote commands (fed by tools/mqtt_bridge.py)
+db.exec('CREATE TABLE IF NOT EXISTS device_events (id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL, pen_id TEXT NOT NULL, kind TEXT NOT NULL, detail TEXT NOT NULL)');
+const devIns = db.prepare('INSERT INTO device_events (ts, pen_id, kind, detail) VALUES (?, ?, ?, ?)');
+const devList = db.prepare('SELECT ts, pen_id, kind, detail FROM device_events WHERE (? = \'\' OR pen_id = ?) ORDER BY id DESC LIMIT ?');
+const dev = new Map(); // pen -> { state, at, cmds }
+const devGet = (pen) => { let d = dev.get(pen); if (!d) { d = { state: null, at: 0, cmds: [] }; dev.set(pen, d); } return d; };
+const str = (v, n) => (typeof v === 'string' ? v.slice(0, n) : '');
+function cleanState(b) {
+  const o = {};
+  if (typeof b.online === 'boolean') o.online = b.online;
+  if (typeof b.device_id === 'string') o.device_id = str(b.device_id, 40);
+  if (['auto', 'manual'].includes(b.mode)) o.mode = b.mode;
+  if (b.camera === null || ['thermal', 'yolo'].includes(b.camera)) o.camera = b.camera;
+  if (b.flags && typeof b.flags === 'object') o.flags = { high_temperature: b.flags.high_temperature ? 1 : 0, abnormal_behavior: b.flags.abnormal_behavior ? 1 : 0 };
+  if (Number.isFinite(b.threshold_c)) o.threshold_c = b.threshold_c;
+  if (Number.isFinite(b.uptime_s)) o.uptime_s = b.uptime_s;
+  if (typeof b.status === 'string') o.status = str(b.status, 200);
+  if (b.sms && typeof b.sms === 'object') o.sms = { enabled: !!b.sms.enabled, state: str(b.sms.state, 20), detail: str(b.sms.detail, 200), time: str(b.sms.time, 40) || null };
+  return o;
+}
+
 const POSTURES = new Set(['Lying', 'Not lying', 'Unknown']);
 const EVENT_TYPES = new Set(['Measurement', 'Session started', 'Session ended', 'Alert', 'Alert acknowledged']);
 const SC = cfg.screening;
@@ -296,7 +317,7 @@ const server = http.createServer(async (req, res) => {
 
     if (m === 'GET' && p === '/api/status') {
       const now = Date.now();
-      return send(res, 200, { server_time: new Date(now).toISOString(), stale_after_s: cfg.stale_after_s, criteria: criteria(), pens: PENS.map((x) => penView(x, now)), registry: reg.all.all() });
+      return send(res, 200, { server_time: new Date(now).toISOString(), stale_after_s: cfg.stale_after_s, criteria: criteria(), pens: PENS.map((x) => { const v = penView(x, now); const d = dev.get(x); v.device = d && d.state ? { ...d.state, age_s: Math.round((now - d.at) / 1000) } : null; return v; }), registry: reg.all.all() });
     }
     const exp = /^\/api\/sessions\/SESSION-(\d{1,9})\/export\.(csv|pdf)$/.exec(p);
     if (m === 'GET' && exp) { // read-only download of one session's records
@@ -335,6 +356,40 @@ const server = http.createServer(async (req, res) => {
       if (!isJpeg(buf)) return fail(res, 415, 'Body must be a JPEG image (Content-Type: image/jpeg).');
       frames.set(`${pvPost[1]}/${pvPost[2]}`, { buf, at: Date.now() });
       return send(res, 200, { ok: true, bytes: buf.length });
+    }
+
+    // ---- Prototype device channel
+    const devPost = /^\/api\/device\/([A-Za-z0-9_-]{1,32})$/.exec(p);
+    const devCmds = /^\/api\/device\/([A-Za-z0-9_-]{1,32})\/commands$/.exec(p);
+    if ((m === 'POST' && devPost) || (m === 'GET' && devCmds)) {
+      const remote = req.socket.remoteAddress || 'unknown';
+      if (!isLoopback(remote)) return fail(res, 403, 'Device data is accepted from the dashboard host only.');
+      if (cfg.ingest_token && req.headers['x-ingest-token'] !== cfg.ingest_token) return fail(res, 403, 'Bad ingest token.');
+      const pen = (devPost || devCmds)[1];
+      if (!PENS.includes(pen)) return fail(res, 404, 'Unknown pen.');
+      const d = devGet(pen);
+      if (devCmds) return send(res, 200, { ok: true, commands: d.cmds.splice(0) });
+      const b = await readJson(req);
+      if (b.state && typeof b.state === 'object') { d.state = { ...(d.state || {}), ...cleanState(b.state) }; d.at = Date.now(); }
+      if (b.event && typeof b.event === 'object') devIns.run(new Date().toISOString(), pen, str(b.event.kind, 40) || 'event', str(b.event.detail, 300));
+      return send(res, 200, { ok: true });
+    }
+    if (m === 'GET' && p === '/api/device/events') {
+      const pen = u.searchParams.get('pen') || '';
+      const lim = Math.min(200, Math.max(1, Number(u.searchParams.get('limit')) || 50));
+      return send(res, 200, { events: devList.all(pen, pen, lim) });
+    }
+    const cmdPost = /^\/api\/pens\/([A-Za-z0-9_-]{1,32})\/command$/.exec(p);
+    if (m === 'POST' && cmdPost) { // UI -> prototype (delivered by the bridge): reset flags, choose camera
+      if (!sameOriginUi(req)) return fail(res, 403, 'Request rejected (missing or cross-origin request header).');
+      if (!reg.get.get(cmdPost[1])) return fail(res, 404, 'Pen is not on the dashboard.');
+      const b = await readJson(req);
+      let cmd;
+      if (b.action === 'reset') cmd = { action: 'reset' };
+      else if (b.action === 'camera' && ['auto', 'thermal', 'yolo', 'stop'].includes(b.kind)) cmd = { action: 'camera', kind: b.kind };
+      else return fail(res, 422, 'Unknown command.');
+      const d = devGet(cmdPost[1]); d.cmds.push(cmd); if (d.cmds.length > 10) d.cmds.shift();
+      return send(res, 200, { ok: true });
     }
 
     // ---- Pen registry (dashboard-managed pens)

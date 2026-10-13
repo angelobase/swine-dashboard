@@ -98,3 +98,8 @@ button.danger{border-color:var(--alert);color:var(--alert)}
 .acts-cell{display:flex;gap:.35rem;align-items:center}
 a.btn{display:inline-flex;align-items:center;min-height:30px;padding:.1rem .6rem;font-size:.85rem;border:1.5px solid var(--accent);border-radius:4px;color:inherit;text-decoration:none;background:var(--card)}
 a.btn:hover{background:var(--accent);color:var(--bg)}
+
+.chips{display:flex;flex-wrap:wrap;gap:.25rem;margin-top:.2rem}
+.chip{font-size:.68rem;padding:0 .4rem;border:1px solid #5b6f6a;border-radius:999px;background:#000a;color:#c0cfcb;white-space:nowrap}
+.chip.ok{border-color:#6fe0c8;color:#6fe0c8}.chip.bad{border-color:#ff8a8a;color:#ff8a8a;font-weight:600}
+@container (max-height:230px){.chips .chip:nth-child(n+3){display:none}}

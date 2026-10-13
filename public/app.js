@@ -57,6 +57,31 @@ async function pvStatus() {
   } catch { /* keep last known preview state */ }
 }
 
+// ---- Prototype controls (reset flags / camera choice are delivered to the device through the MQTT bridge)
+async function sendCmd(pen, body, msg) {
+  try { await api(`/api/pens/${encodeURIComponent(pen)}/command`, { method: 'POST', body: JSON.stringify(body) }); toast(msg); }
+  catch (e) { toast(`Not sent: ${e.message}`, true); }
+}
+const CAMS = ['auto', 'thermal', 'yolo', 'stop'], CAM_LABEL = { auto: 'Auto', thermal: 'Thermal', yolo: 'Webcam', stop: 'Off' };
+function devChips(d) {
+  if (!d) return h('div', { class: 'sub extra' }, 'Prototype: no data yet');
+  const off = d.online === false || d.age_s > 30, f = d.flags || {}, s = d.sms || {};
+  return h('div', { class: 'chips' },
+    h('span', { class: 'chip ' + (off ? 'bad' : 'ok'), title: d.status || '' }, off ? 'Prototype offline' : 'Prototype online'),
+    h('span', { class: 'chip' + (f.high_temperature ? ' bad' : ''), title: `Latched when a surface temperature stays at or above ${d.threshold_c ?? '?'} °C` }, `High temp ${f.high_temperature ? 1 : 0}`),
+    h('span', { class: 'chip' + (f.abnormal_behavior ? ' bad' : '') }, `Abnormal behavior ${f.abnormal_behavior ? 1 : 0}`),
+    s.state ? h('span', { class: 'chip' + (s.state === 'failed' ? ' bad' : ''), title: s.detail || '' }, `SMS ${s.state}`) : null);
+}
+function devButtons(p, d, pen) {
+  if (!d) return [];
+  const cur = d.mode === 'auto' ? 'auto' : (d.camera || 'stop');
+  return [
+    h('button', { type: 'button', disabled: !connected, title: 'Choose which camera the prototype reads',
+      onclick: () => { const nx = CAMS[(CAMS.indexOf(cur) + 1) % CAMS.length]; sendCmd(pen, { action: 'camera', kind: nx }, `Camera: ${CAM_LABEL[nx]} (sent to prototype).`); } }, `Cam: ${CAM_LABEL[cur]}`),
+    h('button', { type: 'button', disabled: !connected, title: 'Clear the latched flags and start a new alert cycle',
+      onclick: () => { if (confirm(`Reset the latched flags on ${pen}? This starts a new alert cycle.`)) sendCmd(pen, { action: 'reset' }, 'Reset sent to prototype.'); } }, 'Reset flags')];
+}
+
 // ---- Tile (one CCTV cell per pen)
 function getTile(pen) {
   let u = tiles.get(pen); if (u) return u;
@@ -103,8 +128,9 @@ function updateTile(p, cfg) {
     h('div', {},
       active ? h('div', { class: 'temp' }, L ? fmtTemp(L.surface_temp_c) : 'No reading') : null,
       active ? h('div', { class: 'sub' }, `Posture: ${L ? L.posture : 'Unknown'}`, h('span', { class: 'extra' }, ` · Lying ${L ? fmtDur(L.lying_s) : '—'}`)) : null,
-      fresh && h('div', { class: 'extra sub' + (p.stale ? ' stale' : '') }, fresh.textContent)),
-    h('div', { class: 'acts' }, u.th,
+      fresh && h('div', { class: 'extra sub' + (p.stale ? ' stale' : '') }, fresh.textContent),
+      devChips(p.device)),
+    h('div', { class: 'acts' }, ...devButtons(p, p.device, p.pen_id), u.th,
       h('button', { type: 'button', class: 'primary', disabled: active || !connected, onclick: () => act(p.pen_id, 'session/start', null) }, active ? 'Active' : 'Start'),
       h('button', { type: 'button', disabled: !active || !connected, onclick: () => { if (confirm(`End ${p.session.code} on ${p.pen_id}? History is kept.`)) act(p.pen_id, 'session/end', null); } }, 'End')));
   return u;
