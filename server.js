@@ -4,6 +4,8 @@ const fs = require('node:fs');
 const path = require('node:path');
 const { open, tx, sessionCode } = require('./lib/db');
 const { buildCsv, buildPdf } = require('./lib/export');
+const { createHub, deviceFromAddress } = require('./lib/mqtt_hub');
+const { startBeacon } = require('./lib/beacon');
 const cfg = require('./lib/config').load();
 const PENS = [...cfg.pens]; // known pens: config.json plus pens added from the dashboard
 const nodeVersion = process.versions.node.split('.').map(Number);
@@ -32,6 +34,13 @@ const reg = {
   del: prep('DELETE FROM pen_registry WHERE pen_id = ?'),
 };
 for (const r of reg.all.all()) if (!PENS.includes(r.pen_id)) PENS.push(r.pen_id);
+// device id (from the pen's prototype address) <-> pen id, for the built-in MQTT hub
+let devToPen = new Map(); let penToDev = new Map();
+function rebuildDeviceMap() {
+  devToPen = new Map(); penToDev = new Map();
+  for (const r of reg.all.all()) { const d = deviceFromAddress(r.address); if (d) { devToPen.set(d, r.pen_id); penToDev.set(r.pen_id, d); } }
+}
+rebuildDeviceMap();
 
 // ---- Prototype device channel: state, events and remote commands (fed by tools/mqtt_bridge.py)
 const devIns = prep('INSERT INTO device_events (ts, pen_id, kind, detail) VALUES (?, ?, ?, ?)');
@@ -51,6 +60,12 @@ function cleanState(b) {
   if (typeof b.status === 'string') o.status = str(b.status, 200);
   if (b.sms && typeof b.sms === 'object') o.sms = { enabled: !!b.sms.enabled, state: str(b.sms.state, 20), detail: str(b.sms.detail, 200), time: str(b.sms.time, 40) || null };
   return o;
+}
+
+function applyDevice(pen, b) {
+  const d = devGet(pen);
+  if (b.state && typeof b.state === 'object') { d.state = { ...(d.state || {}), ...cleanState(b.state) }; d.at = Date.now(); }
+  if (b.event && typeof b.event === 'object') devIns.run(new Date().toISOString(), pen, str(b.event.kind, 40) || 'event', str(b.event.detail, 300));
 }
 
 const POSTURES = new Set(['Lying', 'Not lying', 'Unknown']);
@@ -313,6 +328,11 @@ function previewStatus(now) {
   }
   return { enabled: PV.enabled, refresh_ms: PV.refresh_ms, stale_after_s: PV.stale_after_s, pens };
 }
+function storeFrame(pen, kind, buf) {
+  if (!PV.enabled || !isJpeg(buf) || buf.length > PV.max_frame_bytes) return false;
+  frames.set(`${pen}/${kind}`, { buf: Buffer.from(buf), at: Date.now() });
+  return true;
+}
 // ---- Static files (fixed whitelist; no user-controlled paths)
 const STATIC = { '/': ['index.html', 'text/html; charset=utf-8'], '/app.js': ['app.js', 'text/javascript; charset=utf-8'], '/style.css': ['style.css', 'text/css; charset=utf-8'] };
 
@@ -339,6 +359,7 @@ const server = http.createServer(async (req, res) => {
       res.writeHead(200, { 'Content-Type': csv ? 'text/csv; charset=utf-8' : 'application/pdf', 'Content-Disposition': `attachment; filename="${code}_${sess.pen_id}.${exp[2]}"`, 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff', 'Content-Security-Policy': CSP });
       return res.end(body);
     }
+    if (m === 'GET' && p === '/api/discovered') return send(res, 200, discovered(req.headers.host));
     if (m === 'GET' && p === '/api/log') return send(res, 200, { records: queryLog(u) });
     if (m === 'GET' && p === '/api/sessions') return send(res, 200, { sessions: listSessions() });
 
@@ -361,7 +382,7 @@ const server = http.createServer(async (req, res) => {
       if (!PENS.includes(pvPost[1])) return fail(res, 404, 'Unknown pen.');
       const buf = await readFrame(req);
       if (!isJpeg(buf)) return fail(res, 415, 'Body must be a JPEG image (Content-Type: image/jpeg).');
-      frames.set(`${pvPost[1]}/${pvPost[2]}`, { buf, at: Date.now() });
+      storeFrame(pvPost[1], pvPost[2], buf);
       return send(res, 200, { ok: true, bytes: buf.length });
     }
 
@@ -376,9 +397,7 @@ const server = http.createServer(async (req, res) => {
       if (!PENS.includes(pen)) return fail(res, 404, 'Unknown pen.');
       const d = devGet(pen);
       if (devCmds) return send(res, 200, { ok: true, commands: d.cmds.splice(0) });
-      const b = await readJson(req);
-      if (b.state && typeof b.state === 'object') { d.state = { ...(d.state || {}), ...cleanState(b.state) }; d.at = Date.now(); }
-      if (b.event && typeof b.event === 'object') devIns.run(new Date().toISOString(), pen, str(b.event.kind, 40) || 'event', str(b.event.detail, 300));
+      applyDevice(pen, await readJson(req));
       return send(res, 200, { ok: true });
     }
     if (m === 'GET' && p === '/api/device/events') {
@@ -395,7 +414,11 @@ const server = http.createServer(async (req, res) => {
       if (b.action === 'reset') cmd = { action: 'reset' };
       else if (b.action === 'camera' && ['auto', 'thermal', 'yolo', 'stop'].includes(b.kind)) cmd = { action: 'camera', kind: b.kind };
       else return fail(res, 422, 'Unknown command.');
-      const d = devGet(cmdPost[1]); d.cmds.push(cmd); if (d.cmds.length > 10) d.cmds.shift();
+      if (hub) {
+        const dv = penToDev.get(cmdPost[1]);
+        if (!dv) return fail(res, 422, 'This pen has no valid prototype address.');
+        await hub.sendCommand(dv, cmd);
+      } else { const d = devGet(cmdPost[1]); d.cmds.push(cmd); if (d.cmds.length > 10) d.cmds.shift(); } // legacy: picked up by tools/mqtt_bridge.py
       return send(res, 200, { ok: true });
     }
 
@@ -404,7 +427,12 @@ const server = http.createServer(async (req, res) => {
       if (!sameOriginUi(req)) return fail(res, 403, 'Request rejected (missing or cross-origin request header).');
       const b = await readJson(req);
       const pen = typeof b.pen_id === 'string' ? b.pen_id.trim() : '';
-      const address = typeof b.address === 'string' ? b.address.trim() : '';
+      let address = typeof b.address === 'string' ? b.address.trim() : '';
+      if (!address && typeof b.device_id === 'string' && /^[A-Za-z0-9_-]{1,40}$/.test(b.device_id)) { // picked from the discovered list
+        const used = devToPen.get(b.device_id);
+        if (used) return fail(res, 409, `That prototype is already used by ${used}.`);
+        address = discovered(req.headers.host).devices.find((x) => x.device_id === b.device_id)?.address || `mqtt://localhost:${cfg.mqtt.port}/${b.device_id}`;
+      }
       const camera = typeof b.camera === 'string' ? b.camera.trim() : '';
       if (!/^[A-Za-z0-9_-]{1,32}$/.test(pen)) return fail(res, 422, 'Pen number may use letters, digits, - and _ (max 32).');
       if (!/^\S{1,200}$/.test(address)) return fail(res, 422, 'Prototype address is required (no spaces).');
@@ -412,6 +440,7 @@ const server = http.createServer(async (req, res) => {
       if (reg.get.get(pen)) return fail(res, 409, `${pen} is already on the dashboard.`);
       reg.ins.run(pen, address, camera, new Date().toISOString());
       if (!PENS.includes(pen)) PENS.push(pen);
+      rebuildDeviceMap();
       return send(res, 200, { ok: true, pen_id: pen });
     }
     const penDel = /^\/api\/pens\/([A-Za-z0-9_-]{1,32})$/.exec(p);
@@ -419,6 +448,7 @@ const server = http.createServer(async (req, res) => {
       if (!sameOriginUi(req)) return fail(res, 403, 'Request rejected (missing or cross-origin request header).');
       if (!reg.get.get(penDel[1])) return fail(res, 404, 'Pen is not on the dashboard.');
       reg.del.run(penDel[1]);
+      rebuildDeviceMap();
       return send(res, 200, { ok: true });
     }
     const sesDel = /^\/api\/sessions\/SESSION-(\d{1,9})$/.exec(p);
@@ -461,5 +491,44 @@ server.listen(cfg.port, cfg.host, () => {
   console.log(`Bound address: ${cfg.host}:${cfg.port}. No authentication or encryption is configured; access from other devices is only enabled when HOST is set to the LAN interface or config.json host is changed explicitly.`);
   console.log(`DB: ${cfg.db_path} | screening threshold: ${SC.surface_temp_threshold_c === null ? 'NOT configured (no alerts will fire)' : SC.surface_temp_threshold_c + ' °C'}`);
 });
-const shutdown = () => server.close(() => { db.close(); process.exit(0); });
+// ---- Devices that connected but are not yet a pen (offered in the Add-pen dialog)
+const seen = new Map(); // device id -> { ip, at }
+function noteUnknown(dev, ip) {
+  if (devToPen.has(dev)) return;
+  seen.delete(dev); seen.set(dev, { ip, at: Date.now() });
+  if (seen.size > 50) seen.delete(seen.keys().next().value); // bounded memory
+}
+function discovered(hostHeader) {
+  let host = 'localhost';
+  try { host = new URL('http://' + (hostHeader || 'localhost')).hostname || host; } catch {}
+  const now = Date.now(); const live = new Set(hub ? hub.connectedDevices() : []);
+  const devices = [...seen.entries()].filter(([d, v]) => !devToPen.has(d) && now - v.at < 60000)
+    .sort((a, b) => b[1].at - a[1].at)
+    .map(([d, v]) => ({ device_id: d, ip: v.ip, age_s: Math.round((now - v.at) / 1000), connected: live.has(d), address: `mqtt://${host}:${cfg.mqtt.port}/${d}` }));
+  let n = 1; while (PENS.includes(`PEN-${String(n).padStart(2, '0')}`)) n++;
+  return { devices, suggested_pen_id: `PEN-${String(n).padStart(2, '0')}`, broker: !!hub };
+}
+
+// ---- Built-in MQTT broker + subscriber (replaces Mosquitto and tools/mqtt_bridge.py)
+let hub = null; let beacon = null;
+const warnAt = new Map();
+const quiet = (key, msg) => { const t = Date.now(); if (t - (warnAt.get(key) || 0) > 60000) { warnAt.set(key, t); console.log(msg); } };
+if (cfg.mqtt.enabled) {
+  createHub({
+    mqtt: cfg.mqtt, resolve: (d) => devToPen.get(d) || null,
+    onReading: (pen, r) => {
+      try { ingest({ pen_id: pen, timestamp: new Date().toISOString(), surface_temp_c: r.surface_temp_c, posture: r.posture || 'Unknown' }); } // arrival time: Pi clock drift cannot reject data
+      catch (e) { quiet(`${pen}/${e.code}`, `[mqtt] ${pen}: reading rejected (${e.code || 500}): ${e.message}`); }
+    },
+    onState: (pen, s) => applyDevice(pen, { state: s }),
+    onEvent: (pen, ev) => applyDevice(pen, { event: ev }),
+    onPreview: (pen, kind, buf) => storeFrame(pen, kind, buf),
+    onUnknown: noteUnknown,
+  }).then((h) => {
+    hub = h;
+    if (cfg.mqtt.beacon) beacon = startBeacon({ port: cfg.mqtt.discovery_port, mqttPort: cfg.mqtt.port, requireAuth: h.requireAuth });
+    console.log(`MQTT broker listening on ${cfg.mqtt.host}:${cfg.mqtt.port} (${h.requireAuth ? `login required, user "${cfg.mqtt.username}"` : 'OPEN: no password set; use only on a trusted network'}). Do not also run tools/mqtt_bridge.py or Mosquitto.`);
+  }).catch((e) => { console.error(`[error] MQTT broker is NOT running: ${e.message}. (If the port is busy, stop Mosquitto or change mqtt.port; to turn the broker off set mqtt.enabled=false or MQTT_ENABLED=0.) The dashboard itself keeps running.`); });
+}
+const shutdown = () => server.close(async () => { if (beacon) beacon.close(); if (hub) await hub.close(); db.close(); process.exit(0); });
 process.on('SIGINT', shutdown); process.on('SIGTERM', shutdown);

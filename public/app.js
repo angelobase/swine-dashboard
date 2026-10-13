@@ -148,7 +148,7 @@ function gridFor() {
   return { cols: 3, rows: 2 };                                    // 1080p desktop: 6 pens
 }
 function emptyCell() {
-  return h('div', { class: 'tile empty' }, h('button', { type: 'button', class: 'add-btn', 'aria-label': 'Add a pen', onclick: openAdd }, '+', h('small', {}, 'Add pen')));
+  return h('div', { class: 'tile empty' }, h('button', { type: 'button', class: 'add-btn', 'aria-label': 'Add a pen', onclick: openAdd }, '+', h('small', {}, 'Add pen'), h('small', { class: 'found-note' }, foundText())));
 }
 function renderWall() {
   const { cols, rows } = gridFor();
@@ -173,9 +173,31 @@ async function removePen(pen) {
   catch (e) { toast(`Not removed: ${e.message}`, true); }
   refresh();
 }
-function openAdd() {
-  $('#add-form').reset(); $('#add-dlg').showModal(); $('#a-pen').focus();
+// ---- Prototypes that connected to the built-in broker but are not a pen yet
+let found = [], suggestedPen = 'PEN-01', pickedDevice = '', foundTimer;
+const foundText = () => (found.length ? `${found.length} new prototype${found.length > 1 ? 's' : ''} found` : '');
+async function pollFound() {
+  try { const r = await api('/api/discovered'); found = r.devices; suggestedPen = r.suggested_pen_id; } catch { return; } // old server: feature simply absent
+  document.querySelectorAll('.found-note').forEach((el) => { el.textContent = foundText(); });
+  paintFound();
 }
+function paintFound() {
+  const box = $('#a-found'); if (!$('#add-dlg').open) return;
+  if (pickedDevice && !found.some((d) => d.device_id === pickedDevice)) pickedDevice = '';
+  box.replaceChildren(...(found.length ? found.map((d) => h('button', { type: 'button', 'aria-pressed': String(d.device_id === pickedDevice), onclick: () => pickDevice(d) },
+    h('span', {}, d.device_id), h('span', { class: 'muted' }, `${d.ip || 'unknown IP'} · seen ${d.age_s} s ago`)))
+    : [h('p', { class: 'none' }, 'None yet. Power on the Pi and wait about 20 seconds, or type its address below.')]));
+}
+function pickDevice(d) {
+  pickedDevice = d.device_id; $('#a-addr').value = d.address;
+  if (!$('#a-pen').value.trim()) $('#a-pen').value = suggestedPen;
+  paintFound(); $('#a-pen').focus(); $('#a-pen').select();
+}
+function openAdd() {
+  $('#add-form').reset(); pickedDevice = ''; $('#add-dlg').showModal(); $('#a-pen').focus();
+  paintFound(); pollFound(); clearInterval(foundTimer); foundTimer = setInterval(pollFound, 1500);
+}
+$('#add-dlg').addEventListener('close', () => clearInterval(foundTimer));
 $('#a-cancel').addEventListener('click', () => $('#add-dlg').close());
 $('#add-form').addEventListener('submit', async (e) => {
   e.preventDefault();
@@ -206,6 +228,7 @@ async function refresh() {
     connected = true; $('#conn').className = 'conn'; $('#conn').textContent = `Connected · server time ${fmtTs(s.server_time)}`;
     pensData = s.pens; added = s.registry.map((r) => ({ pen: r.pen_id, address: r.address, camera: r.camera }));
     if (added.length && !document.hidden) await pvStatus(); // preview status only when a pen is displayed
+    pollFound();
     renderWall();
     const c = s.criteria;
     $('#criteria').textContent = c.configured ? `Screening criteria: surface temp ≥ ${c.surface_temp_threshold_c} °C for ${c.consecutive_readings} consecutive readings${c.min_lying_duration_s ? `, lying ≥ ${c.min_lying_duration_s} s` : ''}. Readings older than ${s.stale_after_s} s are marked stale.`

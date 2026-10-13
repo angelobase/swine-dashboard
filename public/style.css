@@ -103,3 +103,12 @@ a.btn:hover{background:var(--accent);color:var(--bg)}
 .chip{font-size:.68rem;padding:0 .4rem;border:1px solid #5b6f6a;border-radius:999px;background:#000a;color:#c0cfcb;white-space:nowrap}
 .chip.ok{border-color:#6fe0c8;color:#6fe0c8}.chip.bad{border-color:#ff8a8a;color:#ff8a8a;font-weight:600}
 @container (max-height:230px){.chips .chip:nth-child(n+3){display:none}}
+
+/* ---- Discovered prototypes (Add-pen dialog + note on the empty tile) ---- */
+.found{margin-bottom:.7rem}.found p{margin:0 0 .3rem}
+.found-list{display:flex;flex-direction:column;gap:.3rem;max-height:11rem;overflow:auto}
+.found-list button{display:flex;justify-content:space-between;gap:.6rem;text-align:left;min-height:40px;padding:.3rem .6rem;font-size:.85rem}
+.found-list .none{font-size:.85rem;color:var(--muted);padding:.3rem 0}
+.tile .add-btn .found-note{color:#f0c15a;font-weight:600}
+.found-list button[aria-pressed=true] .muted{color:inherit;opacity:.9}
+.tile.empty ~ .tile.empty .found-note{display:none} /* show the note once, on the first empty tile */

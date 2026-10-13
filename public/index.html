@@ -50,10 +50,14 @@
 <dialog id="add-dlg">
   <form id="add-form">
     <h2>Add a pen</h2>
+    <div class="found">
+      <p class="muted">Prototypes found on your network <span id="a-found-note"></span></p>
+      <div id="a-found" class="found-list" role="group" aria-label="Prototypes found on your network"></div>
+    </div>
     <label>Pig / pen number
       <input id="a-pen" placeholder="PEN-01" required autocomplete="off">
     </label>
-    <label>Prototype address <span class="muted">(printed when the prototype starts)</span>
+    <label>Prototype address <span class="muted">(filled in when you pick one above, or type it)</span>
       <input id="a-addr" placeholder="mqtt://192.168.4.1:1883/proto-3f9a2c" required autocomplete="off">
     </label>
     <label>Camera capture URL <span class="muted">(optional)</span>

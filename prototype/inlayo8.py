@@ -25,7 +25,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 DEFAULTS = {
     "device_id": "", "advertise_host": "",
-    "mqtt": {"host": "127.0.0.1", "port": 1883, "username": "", "password": ""},
+    "mqtt": {"host": "auto", "port": 1883, "username": "", "password": ""},  # "auto" = find the dashboard on the network
     "high_temperature_threshold_c": 35.0, "behavior_confirmation_s": 1.0,
     "reading_interval_s": 5, "mode": "auto", "cycle_s": 20,
     "gsm": {"enabled": True, "recipient": "+639083082262", "port": "/dev/serial0"},
@@ -121,9 +121,19 @@ class Prototype:
         self.last_state = None
         self.started = time.monotonic()
         self.client = None
+        self.hub = None                      # (host, port) currently used
+        self.mqtt_ok = False
+        self.lost_at = time.monotonic()
 
     # ---- MQTT
     def connect(self):
+        m = self.cfg['mqtt']
+        if str(m['host']).strip().lower() not in ('', 'auto'):
+            self.open_client(m['host'], int(m['port']))  # fixed address typed in prototype.json
+        else:
+            threading.Thread(target=self.discover_loop, daemon=True).start()
+
+    def open_client(self, host, port):
         import paho.mqtt.client as mqtt
         try:
             client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id=self.device)
@@ -133,12 +143,42 @@ class Prototype:
         if m['username']:
             client.username_pw_set(m['username'], m['password'])
         client.will_set(f'{self.base}/status', 'offline', qos=1, retain=True)
-        client.on_connect = lambda c, *a: (c.subscribe(f'{self.base}/cmd', qos=1), c.publish(f'{self.base}/status', 'online', qos=1, retain=True), setattr(self, 'last_state', None))
+        client.on_connect = lambda c, *a: (c.subscribe(f'{self.base}/cmd', qos=1), c.publish(f'{self.base}/status', 'online', qos=1, retain=True), setattr(self, 'last_state', None), setattr(self, 'mqtt_ok', True))
+        client.on_disconnect = lambda c, *a: (setattr(self, 'mqtt_ok', False), setattr(self, 'lost_at', time.monotonic()))
         client.on_message = self.on_message
         client.reconnect_delay_set(1, 30)
-        client.connect_async(m['host'], int(m['port']), keepalive=30)
+        client.connect_async(host, port, keepalive=30)
         client.loop_start()
-        self.client = client
+        self.client, self.hub = client, (host, port)
+        self.lost_at = time.monotonic()
+
+    def close_client(self):
+        client, self.client, self.mqtt_ok = self.client, None, False
+        if client is not None:
+            try:
+                client.disconnect()
+            except Exception:
+                pass
+            client.loop_stop()
+
+    def discover_loop(self):
+        """mqtt.host = "auto": listen for the dashboard's beacon until found, and look again if the link stays down
+        (for example the dashboard computer got a new IP address)."""
+        import hub_discovery
+        announced = None
+        while not self.closing:
+            if self.client is None or (not self.mqtt_ok and time.monotonic() - self.lost_at > 20):
+                found = hub_discovery.find_hub(5.0)
+                if found and found != self.hub:
+                    self.close_client()
+                    self.open_client(*found)
+                    if found != announced:
+                        announced = found
+                        print(f'Found the dashboard at {found[0]}:{found[1]}', flush=True)
+                elif not found and self.client is None:
+                    print('Looking for the dashboard on the network...', flush=True)
+            else:
+                time.sleep(2.0)
 
     def pub(self, suffix, payload, qos=0, retain=False):
         if self.client is not None:
@@ -338,7 +378,8 @@ def main():
     address = f"mqtt://{cfg['advertise_host'] or m['host']}:{m['port']}/{cfg['device_id']}"
     (HERE / 'prototype_address.txt').write_text(address + '\n', encoding='utf-8')
     print('=' * 60, flush=True)
-    print('Prototype address (paste into "Add a pen" in the dashboard):', flush=True)
+    print(f"Prototype id: {cfg['device_id']}", flush=True)
+    print('It will appear in the dashboard under "Add a pen" once it is connected. If you need to type it:', flush=True)
     print('  ' + address, flush=True)
     print('=' * 60, flush=True)
     proto.connect()
