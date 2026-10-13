@@ -1,0 +1,14 @@
+{
+  "name": "swine-monitoring-dashboard",
+  "version": "0.1.0",
+  "description": "Local Raspberry Pi dashboard for pen/session monitoring (screening only, not diagnostic)",
+  "main": "server.js",
+  "engines": { "node": ">=22.13" },
+  "scripts": {
+    "start": "node server.js",
+    "test": "node tools/smoke_test.js",
+    "simulate": "node tools/simulate_pipeline.js"
+  },
+  "license": "UNLICENSED",
+  "private": true
+}

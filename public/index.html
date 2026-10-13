@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Swine Monitoring Dashboard</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body data-view="pens">
+<header class="bar">
+  <h1>Pen Monitor</h1>
+  <nav aria-label="Views">
+    <button class="tab" data-view="pens" aria-current="page">Pens</button>
+    <button class="tab" data-view="records">Sessions &amp; Log</button>
+  </nav>
+  <div id="pager" class="pager" hidden>
+    <button id="pg-prev" type="button" aria-label="Previous pens">‹</button>
+    <span id="pg-label" aria-live="polite"></span>
+    <button id="pg-next" type="button" aria-label="Next pens">›</button>
+  </div>
+  <p id="conn" class="conn" role="status">Connecting…</p>
+  <button id="fs" type="button" aria-label="Toggle full screen" title="Full screen">⛶</button>
+</header>
+<div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
+
+<main>
+  <section id="view-pens"><div id="pens" class="wall"></div><p id="criteria" class="strip"></p></section>
+
+  <section id="view-records" hidden>
+    <div class="panel">
+      <div class="panel-h"><h2>Sessions</h2><span class="muted">Deleting a session also removes its log records.</span></div>
+      <div class="panel-b"><table id="sessions-table"></table></div>
+    </div>
+    <div class="panel">
+      <div class="panel-h">
+        <h2>Log</h2>
+        <form id="log-filters" class="filters">
+          <label>Pen <select id="f-pen"><option value="">All</option></select></label>
+          <label>Session <input id="f-session" placeholder="SESSION-001" pattern="SESSION-[0-9]{1,9}"></label>
+          <label>Event <select id="f-type"><option value="">All</option>
+            <option>Measurement</option><option>Session started</option><option>Session ended</option><option>Alert</option><option>Alert acknowledged</option></select></label>
+          <button type="submit">Apply</button>
+        </form>
+      </div>
+      <div class="panel-b"><table id="log-table"></table><button id="more" hidden>Load older records</button></div>
+    </div>
+  </section>
+</main>
+
+<dialog id="add-dlg">
+  <form id="add-form">
+    <h2>Add a pen</h2>
+    <label>Pig / pen number
+      <input id="a-pen" placeholder="PEN-01" required autocomplete="off">
+    </label>
+    <label>Prototype address
+      <input id="a-addr" placeholder="192.168.1.50:8081" required autocomplete="off">
+    </label>
+    <label>Camera capture URL <span class="muted">(optional)</span>
+      <input id="a-cam" placeholder="http://192.168.1.50:8081/stream.mjpg" autocomplete="off">
+    </label>
+    <p class="muted">Leave the camera URL empty to use frames the pipeline pushes to this dashboard.</p>
+    <div class="dlg-acts"><button type="button" id="a-cancel">Cancel</button><button type="submit" class="primary">Add pen</button></div>
+  </form>
+</dialog>
+<script src="/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,14 @@
+{
+  "host": "127.0.0.1",
+  "port": 8080,
+  "pens": ["PEN-01", "PEN-02", "PEN-03", "PEN-04"],
+  "preview": { "enabled": true },
+  "stale_after_s": 30,
+  "log_interval_s": 10,
+  "max_lying_gap_s": 15,
+  "screening": {
+    "surface_temp_threshold_c": null,
+    "consecutive_readings": 3,
+    "min_lying_duration_s": 0
+  }
+}
