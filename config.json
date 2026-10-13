@@ -2,7 +2,13 @@
   "host": "127.0.0.1",
   "port": 8080,
   "pens": ["PEN-01", "PEN-02", "PEN-03", "PEN-04"],
-  "preview": { "enabled": true },
+  "preview": { 
+    "enabled": true, 
+    "refresh_ms": 1000, 
+    "max_frame_bytes": 262144, 
+    "stale_after_s": 5, 
+    "rate_limit_per_sec": 10 
+  },
   "stale_after_s": 30,
   "log_interval_s": 10,
   "max_lying_gap_s": 15,
