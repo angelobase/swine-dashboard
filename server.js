@@ -16,19 +16,26 @@ fs.mkdirSync(path.dirname(cfg.db_path), { recursive: true });
 const db = open(cfg.db_path);
 
 // ---- Pen registry: which pens are shown on the dashboard, with the prototype address and optional camera URL
-db.exec("CREATE TABLE IF NOT EXISTS pen_registry (pen_id TEXT PRIMARY KEY, address TEXT NOT NULL, camera TEXT NOT NULL DEFAULT '', added_at TEXT NOT NULL)");
+// Extra tables are created at startup. If the database is read-only the server must still start
+// (so database failures are reported per request, as before); the new features then report "not saved".
+let extraTables = true;
+try {
+  db.exec("CREATE TABLE IF NOT EXISTS pen_registry (pen_id TEXT PRIMARY KEY, address TEXT NOT NULL, camera TEXT NOT NULL DEFAULT '', added_at TEXT NOT NULL)");
+  db.exec('CREATE TABLE IF NOT EXISTS device_events (id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL, pen_id TEXT NOT NULL, kind TEXT NOT NULL, detail TEXT NOT NULL)');
+} catch (e) { extraTables = false; console.error('[warn] Could not create extra tables (read-only database?):', e.message); }
+const unwritable = { all: () => [], get: () => undefined, run: () => { throw new Error('Database is not writable; the action was NOT saved.'); } };
+const prep = (sql) => (extraTables ? db.prepare(sql) : unwritable);
 const reg = {
-  all: db.prepare('SELECT pen_id, address, camera FROM pen_registry ORDER BY rowid'),
-  get: db.prepare('SELECT pen_id FROM pen_registry WHERE pen_id = ?'),
-  ins: db.prepare('INSERT INTO pen_registry (pen_id, address, camera, added_at) VALUES (?, ?, ?, ?)'),
-  del: db.prepare('DELETE FROM pen_registry WHERE pen_id = ?'),
+  all: prep('SELECT pen_id, address, camera FROM pen_registry ORDER BY rowid'),
+  get: prep('SELECT pen_id FROM pen_registry WHERE pen_id = ?'),
+  ins: prep('INSERT INTO pen_registry (pen_id, address, camera, added_at) VALUES (?, ?, ?, ?)'),
+  del: prep('DELETE FROM pen_registry WHERE pen_id = ?'),
 };
 for (const r of reg.all.all()) if (!PENS.includes(r.pen_id)) PENS.push(r.pen_id);
 
 // ---- Prototype device channel: state, events and remote commands (fed by tools/mqtt_bridge.py)
-db.exec('CREATE TABLE IF NOT EXISTS device_events (id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL, pen_id TEXT NOT NULL, kind TEXT NOT NULL, detail TEXT NOT NULL)');
-const devIns = db.prepare('INSERT INTO device_events (ts, pen_id, kind, detail) VALUES (?, ?, ?, ?)');
-const devList = db.prepare('SELECT ts, pen_id, kind, detail FROM device_events WHERE (? = \'\' OR pen_id = ?) ORDER BY id DESC LIMIT ?');
+const devIns = prep('INSERT INTO device_events (ts, pen_id, kind, detail) VALUES (?, ?, ?, ?)');
+const devList = prep('SELECT ts, pen_id, kind, detail FROM device_events WHERE (? = \'\' OR pen_id = ?) ORDER BY id DESC LIMIT ?');
 const dev = new Map(); // pen -> { state, at, cmds }
 const devGet = (pen) => { let d = dev.get(pen); if (!d) { d = { state: null, at: 0, cmds: [] }; dev.set(pen, d); } return d; };
 const str = (v, n) => (typeof v === 'string' ? v.slice(0, n) : '');

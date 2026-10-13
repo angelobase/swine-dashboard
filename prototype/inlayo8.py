@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Headless pig-pen prototype: thermal + webcam workers, latched flags, SMS, and an MQTT data stream.
 
-No window is opened. The prototype publishes to its own MQTT broker (see setup_network.sh) and the
-dashboard host's tools/mqtt_bridge.py forwards the data to the web application.
+No window is opened. The prototype publishes to the MQTT broker on the web app's computer (see setup_broker.sh); the same
+machine's tools/mqtt_bridge.py forwards the data to the web application. Many prototypes can share one broker.
 
 Flags are session-level recorded events, NOT matched per-pig diagnoses. Thermal regions and webcam
 pigs are not matched to each other, so the reading's temperature is the hottest stable thermal region.
@@ -13,7 +13,6 @@ import json
 import os
 import queue
 import signal
-import socket
 import subprocess
 import sys
 import tempfile
@@ -50,17 +49,6 @@ def load_config(path):
         except OSError:
             pass
     return cfg
-
-
-def own_ip(cfg):
-    if cfg['advertise_host']:
-        return cfg['advertise_host']
-    try:
-        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
-            s.connect(('10.255.255.255', 1))  # no packet is sent; selects the outgoing interface
-            return s.getsockname()[0]
-    except OSError:
-        return '127.0.0.1'
 
 
 def read_status(path):
@@ -346,7 +334,8 @@ def main():
     cfg = load_config(args.config)
     proto = Prototype(cfg, args.model.resolve())
     m = cfg['mqtt']
-    address = f"mqtt://{own_ip(cfg)}:{m['port']}/{cfg['device_id']}"
+    # The broker lives on the web app's computer. This address tells the bridge which broker and which device to use.
+    address = f"mqtt://{cfg['advertise_host'] or m['host']}:{m['port']}/{cfg['device_id']}"
     (HERE / 'prototype_address.txt').write_text(address + '\n', encoding='utf-8')
     print('=' * 60, flush=True)
     print('Prototype address (paste into "Add a pen" in the dashboard):', flush=True)

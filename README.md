@@ -1,82 +1,138 @@
-# Swine Monitoring Dashboard (Node.js, zero npm dependencies)
+# Swine Monitoring Dashboard + Prototype
 
-Local, browser-based dashboard for the Raspberry Pi. It consumes results from an existing monitoring pipeline; it never opens a camera or runs inference. Screening display only, not a veterinary diagnosis.
+A local web app that shows many pens on one CCTV-style wall. Each pen is watched by a Raspberry Pi prototype
+(thermal camera, webcam, GSM modem) that sends its data over MQTT. Screening results only: **not a veterinary diagnosis.**
 
-## Run
-Requires Node 22.13 or newer (`node:sqlite`). Check the Pi with `node -v`.
+```
+ Pi (pen 1) --\
+ Pi (pen 2) ---+--> Wi-Fi router --> web app computer:  MQTT broker -> tools/mqtt_bridge.py -> dashboard (127.0.0.1:8080)
+ Pi (pen 3) --/
+```
 
-    npm start                      # binds to 127.0.0.1:8080 unless config.json or HOST sets another host
-    npm test                       # smoke tests on a temp DB with synthetic data
-    npm run simulate -- PEN-01 30  # synthetic demo readings only
+The web app computer is the center. Every Pi connects to its one broker. Only the dashboard computer needs a fixed IP.
 
-### Local-only default
-The default is intentionally locked to the loopback interface (`127.0.0.1`) so a fresh `npm start` is not reachable from other devices. To allow LAN access, edit `config.json` and set `"host": "0.0.0.0"` or start with `HOST=<Pi LAN address> npm start` (or `HOST=0.0.0.0` for all addresses). The Pi's LAN address can be found with `hostname -I` (Linux) or `ip addr` / `ifconfig` and then choose the address on the local network, e.g. `192.168.1.42`.
+## What is in this project
 
-Do not port-forward the dashboard to the internet. There is no authentication or encryption; state-changing UI routes only reject accidental or cross-origin requests.
+| Path | What it is | Runs on |
+|---|---|---|
+| `server.js`, `lib/`, `public/` | The web app (Node + SQLite) | Web app computer |
+| `config.json` | Web app settings (screening threshold, preview, stale time) | Web app computer |
+| `tools/mqtt_bridge.py` | Forwards MQTT data to the web app | Web app computer |
+| `tools/` tests | `npm test`, `node tools/preview_test.js` | Web app computer |
+| `prototype/` | Headless prototype: `inlayo8.py`, workers, GSM, `prototype.json` | Each Pi |
+| `deploy/` | Optional systemd files to start things at boot (Linux) | Linux machines |
+| `data/swine.db` | The database. Do not commit it. | Web app computer |
 
-## Pipeline contract
-The project expects the existing pipeline to send one JSON payload per reading to the dashboard on the same machine (loopback only):
+## Requirements
 
-    { "pen_id": "PEN-01", "timestamp": "2026-10-12T06:05:00.000Z", "surface_temp_c": 31.4, "posture": "Lying" }
+- Web app computer: Node 22.13 or newer, Python 3 with `pip install paho-mqtt`, the Mosquitto broker.
+- Each Pi: your existing hardware setup (FLIR Lepton on SPI, webcam, SIM800L on `/dev/serial0`), SPI and serial enabled in `raspi-config`, the model file `YOLOv8A_SD_best.onnx`.
+- One router or Wi-Fi network that the web app computer and every Pi can join.
 
-The dashboard accepts `surface_temp_c` as a number in 0-60 °C or `null`, and accepts `posture` values `"Lying"`, `"Not lying"`, or `"Unknown"`. The pipeline may also send `timestamp` as ISO 8601 UTC or epoch seconds. The real pipeline contract is documented in `docs/INTEGRATION.md`.
+## 1. Set up the web app (once)
 
-Rejected values: missing or future timestamps, unknown pen, no active session, pre-session readings, out-of-order or duplicate timestamps, and invalid temperatures.
+1. Reserve a fixed IP for the web app computer in your router. Below it is called `BROKER_IP`.
+2. In `config.json`, turn on the camera preview and set the screening rule:
+   ```json
+   "preview": { "enabled": true, "refresh_ms": 1000, "max_frame_bytes": 262144, "stale_after_s": 5, "rate_limit_per_sec": 10 },
+   "screening": { "surface_temp_threshold_c": 35.0, "consecutive_readings": 3, "min_lying_duration_s": 0 }
+   ```
+   - `surface_temp_threshold_c`: reading at or above this counts. `null` means no alerts fire.
+   - `consecutive_readings`: readings in a row needed for "Threshold reached".
+   - `min_lying_duration_s`: how long the pig must be lying; `0` turns this off.
+3. Run `npm test` and `node tools/preview_test.js`.
+4. Start it with `npm start`, then open `http://127.0.0.1:8080`. You see empty containers with a **+**.
 
-## Current project features
-The project is a local Raspberry Pi dashboard for observing pen activity and screening state. It is not a camera application and it does not diagnose animals.
+## 2. Set up the MQTT broker (once, on the web app computer)
 
-Current implemented features:
-- Local SQLite-backed storage for pens, sessions, measurements, alerts, and lifecycle log events.
-- Pen/session lifecycle controls: start session, end session, and enforce one active session per pen.
-- Pipeline ingest API at `/api/ingest` for temperature and posture readings from the monitoring pipeline.
-- Session and log views showing historical records, counts, and filters.
-- Screening status states: `Monitoring`, `Threshold reached`, `Inconclusive`, and `No active session`.
-- Alert detection using configured threshold logic with required criteria details displayed in the UI and stored in the log.
-- Alert acknowledgement flow that marks a screening alert as resolved while preserving the original alert history.
-- Stale detection for missing or old readings using the configured stale timeout.
-- Lying duration calculation based on pipeline timestamps, with gaps ignored when they exceed `max_lying_gap_s`.
-- UI state for status cards, pen summaries, and last-updated server time.
-- Light and dark mode support via CSS theme variables.
-- Synthetic test tooling to exercise the app without touching the real database.
-- Loopback-only ingest restriction and same-origin checks for state-changing UI routes.
-- Startup safety checks and default host binding that does not expose the dashboard on every interface.
+- **Linux / Pi OS:** `sudo ./prototype/setup_broker.sh <mqtt-password>`
+- **Windows:**
+  1. Install Mosquitto from mosquitto.org.
+  2. In `C:\Program Files\mosquitto\mosquitto.conf` add:
+     ```
+     listener 1883
+     allow_anonymous false
+     password_file C:\Program Files\mosquitto\swine.passwd
+     ```
+  3. Create the user (as administrator):
+     `"C:\Program Files\mosquitto\mosquitto_passwd.exe" -c -b "C:\Program Files\mosquitto\swine.passwd" swine <mqtt-password>`
+  4. Restart the "Mosquitto Broker" service.
+  5. Allow the port: `netsh advfirewall firewall add rule name="MQTT" dir=in action=allow protocol=TCP localport=1883`
 
-## What was added or implemented in this pass
-- Default bind host changed from `0.0.0.0` to `127.0.0.1` in [config.json](<f:/Side-project/WebApp PD/config.json>) and [lib/config.js](<f:/Side-project/WebApp PD/lib/config.js>), with explicit LAN opt-in documented in this README.
-- Node version enforcement for `node:sqlite` compatibility using Node 22.13+ in [server.js](<f:/Side-project/WebApp PD/server.js>).
-- Safer cumulative lying-duration persistence to avoid losing the counter after a restart, while keeping downtime out of the session total.
-- Ingest rate limiting as a basic guard against runaway pipeline floods.
-- More explicit startup warnings that state the actual bound address and the fact that there is no authentication.
-- Updated smoke testing in [tools/smoke_test.js](<f:/Side-project/WebApp PD/tools/smoke_test.js>) covering the required guardrail behaviors without touching the real DB.
-- New project notes in [docs/INTEGRATION.md](<f:/Side-project/WebApp PD/docs/INTEGRATION.md>) for the pipeline contract and assumptions.
-- Verification status file in [docs/VERIFICATION.md](<f:/Side-project/WebApp PD/docs/VERIFICATION.md>) documenting what was actually tested and what remains untested.
-- README documentation updated to describe the actual current project state, configuration, and local-only security assumptions.
+The username is `swine`. All Pis and the bridge use the same MQTT password.
 
-## Not implemented by default
-RGB/thermal preview, evidence snapshots (the `evidence_path` field is reserved), SMS/push, accounts, cloud, and a one-click history clear. Any history-clearing path must be separate, explicit, and confirmed on purpose.
+## 3. Set up each prototype Pi (repeat per pen)
 
-## Local data and retention
-The data directory is stored under `data/` and the SQLite database is local to the Pi. For capacity/retention, keep the database on the Pi's local disk and rotate or archive older records separately when needed; do not add an automatic purge path as part of the dashboard itself.
+1. Join the Pi to the same Wi-Fi/router as the web app computer.
+2. Copy the `prototype/` folder to the Pi and put `YOLOv8A_SD_best.onnx` inside it.
+3. Run `./setup_pi.sh` (installs `paho-mqtt` and `pyserial`). Install your existing packages (spidev, opencv, numpy, onnxruntime) if they are missing.
+4. Edit `prototype.json`:
+   | Setting | Meaning |
+   |---|---|
+   | `mqtt.host` | `BROKER_IP` |
+   | `mqtt.password` | the MQTT password |
+   | `high_temperature_threshold_c` | surface temperature that latches the High Temperature flag (default 35.0) |
+   | `behavior_confirmation_s` | seconds a condition must last before it counts |
+   | `reading_interval_s` | seconds between readings sent to the web app |
+   | `mode`, `cycle_s` | `auto` alternates thermal and webcam every `cycle_s` seconds |
+   | `gsm.recipient`, `gsm.port` | phone number for alerts, modem serial port |
+   | `gsm.enabled` | `false` turns the SMS off |
+5. Run `python3 inlayo8.py`. It prints, and saves to `prototype_address.txt`, an address like
+   `mqtt://BROKER_IP:1883/proto-3f9a2c`. Each Pi gets its own `device_id` automatically. Do not copy one Pi's `prototype.json` to another after it has run.
 
-## Configuration reference
-The default config is intentionally conservative:
+## 4. Start the bridge (on the web app computer)
 
-    {
-      "host": "127.0.0.1",
-      "port": 8080,
-      "pens": ["PEN-01"],
-      "stale_after_s": 30,
-      "log_interval_s": 10,
-      "max_lying_gap_s": 15,
-      "screening": {
-        "surface_temp_threshold_c": null,
-        "consecutive_readings": 3,
-        "min_lying_duration_s": 0
-      }
-    }
+- Linux / Mac: `MQTT_PASS=<mqtt-password> python3 tools/mqtt_bridge.py`
+- Windows PowerShell: `$env:MQTT_PASS="<mqtt-password>"; python tools/mqtt_bridge.py`
 
-Set `HOST` or `PORT` in the shell to override the values at startup. Use `SWINE_CONFIG` or `SWINE_DB` to point to a custom configuration or database file.
+Leave it running. If you use `INGEST_TOKEN`, set that variable the same way (and for the web app). The bridge reads the pen list from the dashboard, so new pens are picked up within about 10 seconds.
 
-## Change summary
-See `docs/INTEGRATION.md` and `docs/VERIFICATION.md` for the operational contract and the verification status for this build.
+## 5. Add a pen and start monitoring
+
+1. In the dashboard press the **+** in an empty container.
+2. Enter the pig/pen number (letters, digits, `-`, `_`) and paste the Pi's address. Leave the camera URL empty to use the prototype's own camera frames.
+3. Press **Start** on the tile. Readings are accepted only while a session is active.
+
+## Using the dashboard
+
+**Pens page (CCTV wall):**
+- The grid adapts to the screen: 3×2 on a 1080p desktop, 4×2 on very wide screens, 2×2 or 2×3 on tablets, 2 pens on a phone. More pens than fit are split into pages (‹ ›, or the left/right arrow keys). The ⛶ button toggles full screen.
+- A tile shows the live camera image, temperature, posture, lying time, session and status. Borders: green active, dashed amber stale, pulsing red unacknowledged alert.
+- Chips show whether the prototype is online, the two latched flags (High temp, Abnormal behavior), and the SMS state.
+- **Cam** chooses Auto / Thermal / Webcam / Off. **Reset flags** starts a new alert cycle. **Thermal** switches the image view when a thermal frame exists. **Start / End** control the session. ✕ removes the tile (data is kept).
+- The prototype sends one SMS per cycle, when both flags are 1. It is never retried, so check the phone.
+
+**Sessions & Log page:** two separate scrolling panels.
+- Sessions (top): each ended session has **CSV**, **PDF** and **Delete**. Delete also removes that session's log records. Active sessions cannot be deleted.
+- Log (bottom): filter by pen, session and event. The pen filter lists only pens found in the database.
+
+## Start automatically (Linux)
+
+Copy `deploy/swine-*.service` to `/etc/systemd/system/`, set the password in `/etc/swine/swine.env`, and run
+`sudo systemctl enable --now swine-dashboard swine-bridge` on the web app computer and `swine-prototype` on each Pi. See `deploy/INSTALL.txt`. Edit the user and folder paths first if yours differ.
+
+## Security notes
+
+- The web app has **no login**. It listens on `127.0.0.1` only. To open it from other devices set `HOST=0.0.0.0`, and only on a network you trust.
+- Readings, camera frames and device data are accepted only from the web app computer itself (the bridge).
+- The broker accepts connections from your whole network and uses one shared password. Keep it on a trusted network.
+- Never commit `data/swine.db`, `prototype.json` with real passwords, or `swine.env`.
+
+## Troubleshooting
+
+| Symptom | Likely cause |
+|---|---|
+| Tile says **Prototype offline** | Bridge not running, MQTT password mismatch, `mqtt.host` wrong, or port 1883 blocked |
+| No readings in the log | No active session for that pen (the bridge shows HTTP 409) |
+| No camera image | `preview.enabled` is not true, server not restarted, or no frame yet |
+| "No screening threshold is configured" | Set `screening.surface_temp_threshold_c` in `config.json`, then restart |
+| Download saves `export.json` or delete shows "Not found" | An old server is still running; stop it and start the new one |
+| Prototype exits at start | Another controller is running, model file missing, or camera busy; see `camera_logs/*.log` |
+
+## Known limitations
+
+- The prototype code was not run on a real Pi, and the broker and SMS steps were not tested on real hardware. Test the cameras, the SIM800L and the Wi-Fi connection first.
+- The reading's temperature is the hottest stable thermal region, and posture is "Lying" if any tracked pig is lying. Thermal regions and pigs are not matched to each other.
+- Only one camera runs at a time on a Pi, so one of the two values can be briefly missing during a switch.
+- The prototype's threshold (`prototype.json`) and the dashboard's (`config.json`) are independent. Set both to the same value, or they can disagree.
+- `npm test` may print "DB failure test skipped". That check was not confirmed after the pen-registry changes.

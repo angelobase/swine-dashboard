@@ -7,7 +7,7 @@
   "log_interval_s": 10,
   "max_lying_gap_s": 15,
   "screening": {
-    "surface_temp_threshold_c": null,
+    "surface_temp_threshold_c": 35.0,
     "consecutive_readings": 3,
     "min_lying_duration_s": 0
   }
