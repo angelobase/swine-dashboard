@@ -2,10 +2,16 @@
   "device_id": "",
   "advertise_host": "",
   "mqtt": { "host": "auto", "port": 1883, "username": "swine", "password": "change-me" },
-  "high_temperature_threshold_c": 35.0,
-  "behavior_confirmation_s": 1.0,
-  "reading_interval_s": 5,
-  "mode": "auto",
-  "cycle_s": 20,
-  "gsm": { "enabled": true, "recipient": "+639083082262", "port": "/dev/serial0" }
+  "session": { "interval_s": 1800, "duration_s": 68400 },
+  "test": { "interval_s": 30, "duration_s": 300, "send_sms": true },
+  "screening": {
+    "temperature_threshold_c": 36.7,
+    "abnormal_lying_consecutive_captures": 6,
+    "final_temperature_lookback_captures": 3
+  },
+  "capture": { "rgb_warmup_frames": 15, "rgb_frames": 5, "rgb_frame_spacing_s": 0.3, "thermal_frames": 9,
+               "thermal_budget_s": 8.0, "confidence": 0.93, "timeout_s": 120 },
+  "thermal": { "offset_c": 0.0, "calibration_file": "calibration.json" },
+  "save_images": true,
+  "gsm": { "enabled": true, "recipient": "+639083082262", "port": "/dev/serial0", "attempts": 3, "retry_delay_s": 60 }
 }

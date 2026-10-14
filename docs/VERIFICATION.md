@@ -82,3 +82,61 @@ This project is a local Raspberry Pi dashboard for monitoring pen activity. It i
 | Optional preview default | Off unless `preview.enabled` is true in `config.json` |
 
 This file documents only what was actually checked in this environment and does not claim a pass for items that were not run on the target Raspberry Pi hardware.
+
+---
+
+# Scheduled sessions pass (2026-10-14)
+
+## What changed
+- **Pi:** `inlayo8.py` rewritten around scheduled sessions (scheduler, local log, resume after restart, missed captures,
+  end-of-session evaluation, one SMS with limited retries, replay). New: `capture_once.py`, `screening.py`, `pig_ids.py`
+  (placeholder), `pi_store.py`, `calibrate.py`, `tests/test_scheduled.py`. `prototype.json` has new sections.
+  `yolo_worker.py`, `thermal_worker.py`, `gsm_sms.py` are unchanged.
+- **Dashboard:** `server.js` (scheduled sessions, replay requests, test mode, End/Acknowledge for scheduled sessions,
+  legacy live sessions kept for pens without a prototype), `lib/db.js` (in-place migration: adds columns, tables and
+  indexes only), `lib/export.js` (methodology columns and summary), `lib/mqtt_hub.js` (session and sample topics),
+  `lib/config.js` (`scheduled.overdue_grace_s`), `public/app.js`, new `public/schedule.css`, `tools/schedule_test.js`.
+  `index.html`, `style.css` and `beacon.js` are unchanged.
+
+## Environment checked
+Linux workstation, Node v22.22.2, Python 3 with numpy and OpenCV. No Raspberry Pi, cameras, modem or MQTT broker.
+
+## Checks performed
+- `python3 -m unittest discover -s tests` (14 tests, passed 6 runs in a row): threshold boundary (36.7 counts), lying
+  bouts and statuses, the lookback rule, SMS length and GSM characters, placeholder IDs, burst clustering, box mapping
+  and per-pig temperature; `capture_once.run()` end to end through the real `yolo_worker.py` and `thermal_worker.py`
+  with the Lepton, webcam and model faked; a full test session; resume after a simulated power cut with missed
+  captures; early End; replay; refused start; restart during SMS sending (reported unknown, not resent); SMS retries
+  only before the text reaches the modem.
+- `node tools/schedule_test.js` (52 checks, passed 3 runs in a row) on a temporary config and an OLD-schema database:
+  migration keeps legacy data; test mode; start command; confirmation; captures; duplicate replays ignored; missing
+  captures requested; overdue capture; finish with one alert record; later SMS update; acknowledging an ended
+  session's alert; CSV and PDF exports; Pi-started, superseded, refused, offline-finished and deleted sessions; legacy
+  live pens still working.
+- Browser render in headless Chromium with a stand-in `index.html` and `style.css` (the real ones were not
+  available): Pens view (running, waiting and finished-with-alert tiles), Records view, phone width, Test mode
+  toggle. No JavaScript errors; the only 404 was the browser's own favicon request.
+- `node --check` on all changed JavaScript files; `py_compile` on all Python files.
+
+## Not verified
+- Anything on the Raspberry Pi: real Lepton bursts, webcam warm-up, model load time per capture, total capture
+  duration (needed to confirm the 30 s test interval and the 120 s capture timeout), memory and temperature.
+- The real SIM800L: the AT sequence is the same as `gsm_sms.py`, but the staged send was only tested with fakes.
+- MQTT end to end (paho on the Pi to aedes in the dashboard), including the retained session message and replay over
+  a real Wi-Fi drop. The server side was exercised through the loopback device route instead.
+- `calibrate.py` (needs a screen and both cameras); only its fitting logic is shared with tested code.
+- The dashboard with the real `index.html` and `style.css`, and the existing `npm test` and `tools/preview_test.js`
+  (not available here).
+- A full 19-hour run.
+
+## Simulator pass (2026-10-14, later the same day)
+- `tools/test_push.py` (dummy prototype, real `inlayo8.py` code) was run over HTTP against the real dashboard server:
+  a full session with alert and simulated SMS; 35 % of captures deliberately lost and all recovered by replay over
+  about 90 s; End pressed on the dashboard during a session (prototype ended early, no SMS); tile render in Chromium
+  with the simulated RGB and thermal images.
+- Bugs found by it and fixed: a dashboard session stayed "evaluating" after the SMS finished (now becomes
+  "finished"; covered by 2 new checks, 54 in total); durations under a minute showed as "0 min" on the tile and "0m"
+  in the SMS (now shown in seconds; covered by a Pi test).
+- `inlayo8.py` and `capture_once.py` now import `fcntl` inside the functions that use it, so they load on Windows.
+- Not verified: the simulator's MQTT mode (paho-mqtt and the aedes broker were not installed here), and running it
+  on Windows.

@@ -2,7 +2,8 @@
 const http = require('node:http');
 const fs = require('node:fs');
 const path = require('node:path');
-const { open, tx, sessionCode } = require('./lib/db');
+const crypto = require('node:crypto');
+const { open, tx, sessionCode, migrate } = require('./lib/db');
 const { buildCsv, buildPdf } = require('./lib/export');
 const { createHub, deviceFromAddress } = require('./lib/mqtt_hub');
 const { startBeacon } = require('./lib/beacon');
@@ -24,6 +25,7 @@ let extraTables = true;
 try {
   db.exec("CREATE TABLE IF NOT EXISTS pen_registry (pen_id TEXT PRIMARY KEY, address TEXT NOT NULL, camera TEXT NOT NULL DEFAULT '', added_at TEXT NOT NULL)");
   db.exec('CREATE TABLE IF NOT EXISTS device_events (id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL, pen_id TEXT NOT NULL, kind TEXT NOT NULL, detail TEXT NOT NULL)');
+  migrate(db); // scheduled sessions: adds columns/tables only, existing data is kept
 } catch (e) { extraTables = false; console.error('[warn] Could not create extra tables (read-only database?):', e.message); }
 const unwritable = { all: () => [], get: () => undefined, run: () => { throw new Error('Database is not writable; the action was NOT saved.'); } };
 const prep = (sql) => (extraTables ? db.prepare(sql) : unwritable);
@@ -52,7 +54,9 @@ function cleanState(b) {
   const o = {};
   if (typeof b.online === 'boolean') o.online = b.online;
   if (typeof b.device_id === 'string') o.device_id = str(b.device_id, 40);
-  if (['auto', 'manual'].includes(b.mode)) o.mode = b.mode;
+  if (['auto', 'manual', 'scheduled'].includes(b.mode)) o.mode = b.mode;
+  if (typeof b.capturing === 'boolean') o.capturing = b.capturing;
+  if (b.session_state === null || typeof b.session_state === 'string') o.session_state = b.session_state ? str(b.session_state, 20) : null;
   if (b.camera === null || ['thermal', 'yolo'].includes(b.camera)) o.camera = b.camera;
   if (b.flags && typeof b.flags === 'object') o.flags = { high_temperature: b.flags.high_temperature ? 1 : 0, abnormal_behavior: b.flags.abnormal_behavior ? 1 : 0 };
   if (Number.isFinite(b.threshold_c)) o.threshold_c = b.threshold_c;
@@ -65,7 +69,14 @@ function cleanState(b) {
 function applyDevice(pen, b) {
   const d = devGet(pen);
   if (b.state && typeof b.state === 'object') { d.state = { ...(d.state || {}), ...cleanState(b.state) }; d.at = Date.now(); }
-  if (b.event && typeof b.event === 'object') devIns.run(new Date().toISOString(), pen, str(b.event.kind, 40) || 'event', str(b.event.detail, 300));
+  if (b.event && typeof b.event === 'object') {
+    devIns.run(new Date().toISOString(), pen, str(b.event.kind, 40) || 'event', str(b.event.detail, 300));
+    if (b.event.kind === 'start_refused' && typeof b.event.uid === 'string') refuseStart(pen, b.event.uid, str(b.event.detail, 200));
+  }
+  let out = { ok: true };
+  if (b.session && typeof b.session === 'object') out = { ...out, ...onSession(pen, b.session) };
+  if (b.sample && typeof b.sample === 'object') out = { ...out, ...onSample(pen, b.sample) };
+  return out;
 }
 
 const POSTURES = new Set(['Lying', 'Not lying', 'Unknown']);
@@ -110,6 +121,241 @@ function getLive(sess) {
   return l;
 }
 
+// ---- Scheduled sessions: the prototype runs the session, keeps its own log, evaluates at the end and sends the SMS.
+// The dashboard records what the prototype reports (retained 'session' message + one 'sample' per capture) and asks
+// for any capture it missed. Lifecycle times and sample times come from the prototype (clock corrected at start).
+const UID_RE = /^[A-Za-z0-9_-]{6,40}$/;
+const SCHED_STATES = new Set(['running', 'evaluating', 'finished', 'ended_early', 'abandoned']);
+const SCHED_TERMINAL = new Set(['evaluating', 'finished', 'ended_early', 'abandoned']);
+const BEHAVIOR = new Set(['Normal', 'Abnormal', 'No data']);
+const THERMAL = new Set(['Normal', 'Elevated', 'No result']);
+const sq = {
+  byUid: prep('SELECT * FROM sessions WHERE uid = ?'),
+  byId: prep('SELECT * FROM sessions WHERE id = ?'),
+  ins: prep(`INSERT INTO sessions (pen_id, started_at, ended_at, kind, uid, test, interval_s, duration_s, ends_at, state, info)
+             VALUES (?, ?, ?, 'scheduled', ?, ?, ?, ?, ?, ?, ?)`),
+  info: prep('UPDATE sessions SET state = ?, started_at = ?, test = ?, interval_s = ?, duration_s = ?, ends_at = ?, info = ? WHERE id = ?'),
+  end: prep('UPDATE sessions SET ended_at = ?, state = ?, result = ?, sms = ?, alert_active = ? WHERE id = ?'),
+  sms: prep('UPDATE sessions SET sms = ? WHERE id = ?'),
+  state: prep('UPDATE sessions SET state = ? WHERE id = ?'),
+  closeLocal: prep('UPDATE sessions SET ended_at = ?, state = ? WHERE id = ?'),
+  rec: prep(`INSERT OR IGNORE INTO records (ts, pen_id, session_id, event_type, surface_temp_c, posture, lying_s, screening_status, detail,
+             evidence_path, seq, pig_id, behavioral_status, thermal_status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`),
+  seqs: prep("SELECT DISTINCT seq FROM records WHERE session_id = ? AND event_type = 'Measurement' AND seq IS NOT NULL ORDER BY seq"),
+  last: prep(`SELECT * FROM records WHERE session_id = ? AND event_type = 'Measurement' AND seq =
+             (SELECT MAX(seq) FROM records WHERE session_id = ? AND event_type = 'Measurement') ORDER BY IFNULL(pig_id, 0)`),
+  latestOfPen: prep('SELECT * FROM sessions WHERE pen_id = ? ORDER BY id DESC LIMIT 1'),
+  deleted: prep('SELECT uid FROM deleted_sessions WHERE uid = ?'),
+  markDeleted: prep('INSERT OR IGNORE INTO deleted_sessions (uid, deleted_at) VALUES (?, ?)'),
+  getSetting: prep('SELECT value FROM settings WHERE key = ?'),
+  setSetting: prep('INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value'),
+};
+const alertedSession = db.prepare('SELECT * FROM sessions WHERE pen_id = ? AND alert_active = 1 ORDER BY id DESC LIMIT 1');
+const unprocessable = (m, code = 422) => Object.assign(new Error(m), { code });
+const json = (v) => (v == null ? null : JSON.stringify(v));
+const parseJ = (t) => { try { return t ? JSON.parse(t) : null; } catch { return null; } };
+const isoOrNull = (v) => { const t = typeof v === 'string' ? Date.parse(v) : NaN; return Number.isFinite(t) ? new Date(t).toISOString() : null; };
+const num = (v, lo, hi) => (typeof v === 'number' && Number.isFinite(v) && v >= lo && v <= hi ? v : null);
+const testMode = () => { try { const r = sq.getSetting.get('test_mode'); return !!(r && r.value === '1'); } catch { return false; } };
+
+function cleanResult(r) {
+  if (!r || typeof r !== 'object' || !Array.isArray(r.pigs)) return null;
+  const pigs = r.pigs.slice(0, 500).map((p) => ({
+    pig_id: Number.isInteger(p.pig_id) ? p.pig_id : null, alert: !!p.alert,
+    longest_lying_s: num(p.longest_lying_s, 0, 1e7), longest_lying_captures: Number.isInteger(p.longest_lying_captures) ? p.longest_lying_captures : null,
+    lying_captures: Number.isInteger(p.lying_captures) ? p.lying_captures : null, final_temp_c: num(p.final_temp_c, 0, 60),
+    behavioral_status: BEHAVIOR.has(p.behavioral_status) ? p.behavioral_status : null,
+    thermal_status: THERMAL.has(p.thermal_status) ? p.thermal_status : null, reason: str(p.reason, 80) || null,
+  })).filter((p) => p.pig_id !== null);
+  const rule = r.rule && typeof r.rule === 'object' ? { threshold_c: num(r.rule.threshold_c, 0, 60), consecutive_captures: num(r.rule.consecutive_captures, 1, 1e4),
+    lookback_captures: num(r.rule.lookback_captures, 1, 1e4), interval_s: num(r.rule.interval_s, 0, 1e6) } : null;
+  return { pigs, flagged: pigs.filter((p) => p.alert).map((p) => p.pig_id), any_alert: pigs.some((p) => p.alert), rule };
+}
+function cleanSms(v) {
+  return v && typeof v === 'object' ? { enabled: !!v.enabled, state: str(v.state, 20), detail: str(v.detail, 300), time: isoOrNull(v.time) } : null;
+}
+function cleanSession(m) {
+  if (!UID_RE.test(m.uid || '')) throw unprocessable('Session id missing or invalid.');
+  if (!SCHED_STATES.has(m.state)) throw unprocessable('Unknown session state.');
+  const started = isoOrNull(m.started_at); if (!started) throw unprocessable('started_at is required.');
+  const interval = num(m.interval_s, 0.01, 86400), duration = num(m.duration_s, 0.01, 7 * 86400);
+  if (interval === null || duration === null) throw unprocessable('interval_s and duration_s must be positive numbers.');
+  const rule = m.rule && typeof m.rule === 'object' ? m.rule : {};
+  return { uid: m.uid, state: m.state, started_at: started, test: !!m.test, interval_s: interval, duration_s: duration,
+    ends_at: isoOrNull(m.ends_at), ended_at: isoOrNull(m.ended_at), result: cleanResult(m.result), sms: cleanSms(m.sms),
+    info: { captures: Number.isInteger(m.captures) ? m.captures : null, next_seq: Number.isInteger(m.next_seq) ? m.next_seq : null,
+      last_seq: Number.isInteger(m.last_seq) ? m.last_seq : null, next_capture_at: isoOrNull(m.next_capture_at),
+      capturing: !!m.capturing, stopping: !!m.stopping, clock_source: m.clock_source === 'dashboard' ? 'dashboard' : 'pi',
+      rule: { threshold_c: num(rule.threshold_c, 0, 60), consecutive_captures: num(rule.consecutive_captures, 1, 1e4), lookback_captures: num(rule.lookback_captures, 1, 1e4) },
+      received_at: new Date().toISOString() } };
+}
+function sessionStartRecord(pen, id, at, m, note) {
+  q.insRecord.run(at, pen, id, 'Session started', null, null, 0, null,
+    JSON.stringify({ kind: 'scheduled', test: m.test, interval_s: m.interval_s ?? null, duration_s: m.duration_s ?? null, note: note || null }));
+}
+function closeActiveScheduled(act, state, note) {
+  const now = new Date().toISOString();
+  sq.closeLocal.run(now, state, act.id);
+  q.insRecord.run(now, act.pen_id, act.id, 'Session ended', null, null, null, state, JSON.stringify({ kind: 'note', note }));
+  live.delete(act.pen_id);
+}
+function terminalLabel(state, result) {
+  if (result && result.any_alert) return 'Alert';
+  return { finished: 'No alert', evaluating: 'No alert', ended_early: 'Ended early', abandoned: 'Abandoned' }[state] || state;
+}
+// Records the end-of-session evaluation once (also when it arrives after the session was closed on the dashboard).
+function recordEvaluation(s, m, adopted = false) {
+  const first = !s.ended_at || adopted, fresh = !s.result && m.result;
+  if (!first && !fresh) return false;
+  const ended = s.ended_at || m.ended_at || new Date().toISOString();
+  const res = m.result || parseJ(s.result);
+  tx(db, () => {
+    sq.end.run(ended, first ? m.state : s.state, json(res), json(m.sms), res && res.any_alert ? 1 : s.alert_active, s.id);
+    q.insRecord.run(ended, s.pen_id, s.id, 'Session ended', null, null, null, terminalLabel(m.state, res),
+      JSON.stringify({ kind: 'evaluation', state: m.state, result: res, sms: m.sms, note: first ? null : 'Evaluation received after the session was closed on the dashboard.' }));
+    for (const p of (res && res.pigs) || []) {
+      if (!p.alert) continue;
+      sq.rec.run(ended, s.pen_id, s.id, 'Alert', p.final_temp_c, null, p.longest_lying_s, 'Alert',
+        JSON.stringify({ kind: 'pig_alert', pig_id: p.pig_id, final_temp_c: p.final_temp_c, longest_lying_s: p.longest_lying_s, rule: res.rule, reason: p.reason }),
+        null, null, p.pig_id, p.behavioral_status, p.thermal_status);
+    }
+  });
+  live.delete(s.pen_id);
+  return true;
+}
+
+function onSession(pen, raw) {
+  const m = cleanSession(raw);
+  let s = sq.byUid.get(m.uid);
+  if (s && s.pen_id !== pen) throw unprocessable(`Session ${m.uid} belongs to ${s.pen_id}.`, 409);
+  if (!s) {
+    if (sq.deleted.get(m.uid)) return { ignored: 'deleted on the dashboard' };
+    const terminal = SCHED_TERMINAL.has(m.state);
+    const id = tx(db, () => {
+      if (!terminal) { // the prototype is the source of truth for what is running now
+        const act = q.active.get(pen);
+        if (act && act.kind !== 'scheduled') throw unprocessable(`${pen} has an active live session; end it to record the prototype's session.`, 409);
+        if (act) closeActiveScheduled(act, act.state === 'starting' ? 'refused' : 'superseded',
+          `The prototype is running session ${m.uid} instead.`);
+      }
+      // a session the dashboard has not seen (started with --start, or run while the dashboard was down)
+      // a finished session is inserted already ended, so it never counts as this pen's active session
+      const sid = Number(sq.ins.run(pen, m.started_at, terminal ? (m.ended_at || new Date().toISOString()) : null, m.uid, m.test ? 1 : 0,
+        m.interval_s, m.duration_s, m.ends_at, m.state, JSON.stringify(m.info)).lastInsertRowid);
+      sessionStartRecord(pen, sid, m.started_at, m, 'Started on the prototype.');
+      return sid;
+    });
+    live.delete(pen);
+    s = sq.byId.get(id);
+    if (terminal) { recordEvaluation(s, m, true); s = sq.byId.get(id); }
+  } else if (!s.ended_at) {
+    const st = s.state === 'stopping' && m.state === 'running' ? 'stopping' : m.state; // keep a pending End visible
+    sq.info.run(st, m.started_at, m.test ? 1 : 0, m.interval_s, m.duration_s, m.ends_at, JSON.stringify(m.info), s.id);
+    s = sq.byId.get(s.id);
+  } else if (m.info) {
+    sq.info.run(s.state, s.started_at, s.test, s.interval_s, s.duration_s, s.ends_at, JSON.stringify(m.info), s.id);
+  }
+  if (SCHED_TERMINAL.has(m.state)) {
+    if (!recordEvaluation(s, m)) {
+      if (s.state === 'evaluating' && m.state !== 'evaluating') sq.state.run(m.state, s.id); // SMS done: evaluating -> finished
+      if (m.sms && json(m.sms) !== s.sms) {
+        sq.sms.run(json(m.sms), s.id);
+        devIns.run(new Date().toISOString(), pen, 'sms_' + (m.sms.state || 'update'), m.sms.detail || '');
+      }
+    }
+  }
+  requestReplay(pen, sq.byId.get(s.id), m.info.last_seq);
+  return { session: sessionCode(s.id) };
+}
+
+function onSample(pen, b) {
+  if (!UID_RE.test(b.uid || '')) throw unprocessable('Sample without a valid session id.');
+  const s = sq.byUid.get(b.uid);
+  if (!s) throw unprocessable('Sample for a session the dashboard does not know yet.', 409);
+  if (s.pen_id !== pen) throw unprocessable(`Session ${b.uid} belongs to ${s.pen_id}.`, 409);
+  if (!Number.isInteger(b.seq) || b.seq < 0 || b.seq > 100000) throw unprocessable('seq must be a non-negative integer.');
+  const ts = isoOrNull(b.ts);
+  if (!ts) throw unprocessable('A valid capture timestamp is required.');
+  const t = Date.parse(ts), start = Date.parse(s.started_at), end = s.ends_at ? Date.parse(s.ends_at) : t;
+  if (t < start - 120000 || t > end + 3600000) throw unprocessable('Capture time is outside this session.');
+  const pigs = Array.isArray(b.pigs) ? b.pigs.slice(0, 200) : [];
+  const evidence = b.images && typeof b.images.rgb === 'string' ? validateEvidencePath('pi/' + b.images.rgb) : null;
+  const base = { kind: 'sample', capture_ok: !!b.ok, error: str(b.error, 200) || null, thermal_error: str(b.thermal_error, 200) || null,
+    calibrated: !!b.calibrated, thermal_image: b.images && typeof b.images.thermal === 'string' ? validateEvidencePath('pi/' + b.images.thermal) : null };
+  let inserted = 0;
+  tx(db, () => {
+    if (!pigs.length) {
+      inserted += Number(sq.rec.run(ts, pen, s.id, 'Measurement', null, 'Unknown', null, b.ok ? 'No pigs detected' : 'Capture failed',
+        JSON.stringify(base), evidence, b.seq, null, 'No data', 'No result').changes);
+      return;
+    }
+    for (const p of pigs) {
+      if (!Number.isInteger(p.pig_id) || p.pig_id < 1) throw unprocessable('pig_id must be a positive integer.');
+      const posture = POSTURES.has(p.posture) ? p.posture : 'Unknown';
+      const temp = num(p.surface_temp_c, 0, 60);
+      inserted += Number(sq.rec.run(ts, pen, s.id, 'Measurement', temp, posture, num(p.lying_s, 0, 1e7),
+        b.ok ? (p.observed === false ? 'Not detected' : 'Captured') : 'Capture failed',
+        JSON.stringify({ ...base, observed: p.observed !== false, confidence: num(p.confidence, 0, 1), frames_seen: Number.isInteger(p.frames_seen) ? p.frames_seen : null }),
+        evidence, b.seq, p.pig_id, BEHAVIOR.has(p.behavioral_status) ? p.behavioral_status : 'No data',
+        THERMAL.has(p.thermal_status) ? p.thermal_status : 'No result').changes);
+    }
+  });
+  return { stored: inserted };
+}
+
+// Ask the prototype for captures the dashboard is missing (Wi-Fi drop, dashboard restart). At most every 15 s per session.
+const replayAt = new Map();
+function requestReplay(pen, s, lastSeq) {
+  if (!s || !Number.isInteger(lastSeq) || lastSeq < 0) return;
+  const have = new Set(sq.seqs.all(s.id).map((r) => r.seq));
+  const missing = [];
+  for (let k = 0; k <= lastSeq && missing.length < 100; k++) if (!have.has(k)) missing.push(k);
+  if (!missing.length) return;
+  const now = Date.now();
+  if (now - (replayAt.get(s.id) || 0) < 15000) return;
+  replayAt.set(s.id, now);
+  sendToDevice(pen, { action: 'replay', uid: s.uid, seqs: missing });
+}
+function deviceConnected(pen) {
+  const dv = penToDev.get(pen);
+  return !!(dv && hub && hub.connectedDevices().includes(dv));
+}
+function sendToDevice(pen, cmd) {
+  const dv = penToDev.get(pen);
+  if (!dv) return false;
+  if (hub) { hub.sendCommand(dv, cmd).catch(() => {}); return true; }
+  const d = devGet(pen); d.cmds.push(cmd); if (d.cmds.length > 10) d.cmds.shift(); // legacy: picked up by tools/mqtt_bridge.py
+  return true;
+}
+function refuseStart(pen, uid, detail) {
+  const s = sq.byUid.get(uid);
+  if (s && s.pen_id === pen && !s.ended_at && s.state === 'starting') closeActiveScheduled(s, 'refused', `Prototype refused the start: ${detail}`);
+}
+
+function schedView(s, nowMs) {
+  const info = parseJ(s.info) || {};
+  const rows = sq.last.all(s.id, s.id);
+  const next = info.next_capture_at ? Date.parse(info.next_capture_at) : null;
+  const overdue = s.state === 'running' && next !== null && nowMs > next + cfg.scheduled.overdue_grace_s * 1000;
+  const waiting = s.state === 'starting';
+  const last = rows.length ? {
+    seq: rows[0].seq, ts: rows[0].ts, status: rows[0].screening_status, error: (parseJ(rows[0].detail) || {}).error || null,
+    pigs: rows.filter((r) => r.pig_id !== null).map((r) => ({ pig_id: r.pig_id, posture: r.posture, lying_s: r.lying_s, surface_temp_c: r.surface_temp_c,
+      behavioral_status: r.behavioral_status, thermal_status: r.thermal_status, observed: r.screening_status !== 'Not detected' })),
+  } : null;
+  return { uid: s.uid, state: s.state, test: !!s.test, started_at: s.started_at, ends_at: s.ends_at, interval_s: s.interval_s,
+    duration_s: s.duration_s, captures: info.captures ?? null, next_seq: info.next_seq ?? 0, next_capture_at: info.next_capture_at || null,
+    capturing: !!info.capturing, stopping: !!info.stopping || s.state === 'stopping', received: sq.seqs.all(s.id).length,
+    rule: info.rule || null, clock_source: info.clock_source || null, last, overdue, waiting,
+    result: parseJ(s.result), sms: parseJ(s.sms), ended_at: s.ended_at };
+}
+function schedStatus(v) {
+  if (v.waiting) return { status: 'Waiting for prototype', note: 'The start command was sent. The prototype confirms it within a few seconds when it is connected.' };
+  if (v.stopping) return { status: 'Ending', note: 'Asked the prototype to end the session early.' };
+  if (v.overdue) return { status: 'Capture overdue', note: `The capture planned for ${v.next_capture_at} has not arrived. The prototype may be offline; it keeps its own log and the dashboard fetches missed captures when it reconnects.` };
+  return { status: 'Monitoring', note: 'Screening only, evaluated by the prototype at the end of the session. Not a diagnosis.' };
+}
+
 function screening(l, nowMs) {
   // Returns { status, note }. Never claims a diagnosis; never invents criteria.
   if (!l || l.ts === null) return { status: 'Inconclusive', note: 'No reading received yet for this session.' };
@@ -126,7 +372,15 @@ function penView(pen, nowMs) {
   const v = { pen_id: pen, session: null, latest: null, status: 'No active session', status_note: '', stale: false, age_s: null, alert: null, last_ended_session: null };
   const e = q.lastEnded.get(pen);
   if (e) v.last_ended_session = sessionCode(e.id);
-  if (!s) return v;
+  scheduledAlert(v, pen);
+  if (!s) { lastScheduled(v, pen); return v; }
+  if (s.kind === 'scheduled') {
+    v.session = { code: sessionCode(s.id), started_at: s.started_at, scheduled: true, test: !!s.test };
+    v.schedule = schedView(s, nowMs);
+    const st = schedStatus(v.schedule);
+    v.status = st.status; v.status_note = st.note; v.stale = v.schedule.overdue;
+    return v;
+  }
   const l = getLive(s);
   v.session = { code: sessionCode(s.id), started_at: s.started_at };
   if (l.ts !== null) {
@@ -137,8 +391,23 @@ function penView(pen, nowMs) {
   const sc = screening(l, nowMs);
   v.status = sc.status; v.status_note = sc.note;
   const a = q.lastAlert.get(s.id);
-  if (a) v.alert = { ts: a.ts, active: !!s.alert_active, detail: JSON.parse(a.detail) };
+  if (a && !(v.alert && v.alert.kind === 'scheduled')) v.alert = { ts: a.ts, active: !!s.alert_active, detail: JSON.parse(a.detail) };
   return v;
+}
+// Unacknowledged end-of-session alert of a scheduled session (shown until acknowledged, also while a new session runs).
+function scheduledAlert(v, pen) {
+  const a = alertedSession.get(pen);
+  if (!a || a.kind !== 'scheduled') return;
+  const r = parseJ(a.result) || { pigs: [] };
+  v.alert = { kind: 'scheduled', active: true, ts: a.ended_at, session: sessionCode(a.id), test: !!a.test,
+    pigs: r.pigs.filter((p) => p.alert), rule: r.rule || null, sms: parseJ(a.sms) };
+}
+function lastScheduled(v, pen) {
+  const last = sq.latestOfPen.get(pen);
+  if (!last || last.kind !== 'scheduled' || !last.ended_at) return;
+  const r = parseJ(last.result);
+  v.last_result = { session: sessionCode(last.id), state: last.state, test: !!last.test, ended_at: last.ended_at,
+    pigs: r ? r.pigs.length : null, flagged: r ? r.flagged : [], rule: r ? r.rule : null, sms: parseJ(last.sms) };
 }
 
 // ---- HTTP helpers
@@ -148,10 +417,10 @@ function send(res, code, body, type = 'application/json; charset=utf-8') {
   res.end(typeof body === 'string' || Buffer.isBuffer(body) ? body : JSON.stringify(body));
 }
 const fail = (res, code, error) => send(res, code, { ok: false, error });
-function readJson(req) {
+function readJson(req, max = 8192) {
   return new Promise((resolve, reject) => {
     let n = 0; const chunks = [];
-    req.on('data', (c) => { n += c.length; if (n > 8192) { reject(Object.assign(new Error('Body too large'), { code: 413 })); req.destroy(); } else chunks.push(c); });
+    req.on('data', (c) => { n += c.length; if (n > max) { reject(Object.assign(new Error('Body too large'), { code: 413 })); req.destroy(); } else chunks.push(c); });
     req.on('end', () => { try { resolve(chunks.length ? JSON.parse(Buffer.concat(chunks)) : {}); } catch { reject(Object.assign(new Error('Invalid JSON'), { code: 400 })); } });
     req.on('error', reject);
   });
@@ -187,6 +456,7 @@ function sameOriginUi(req) {
 
 // ---- Session lifecycle (server clock is used for lifecycle events)
 function startSession(pen) {
+  if (penToDev.get(pen)) return startScheduled(pen);
   const now = new Date().toISOString();
   const id = tx(db, () => {
     if (q.active.get(pen)) throw Object.assign(new Error(`${pen} already has an active session.`), { code: 409 });
@@ -197,7 +467,39 @@ function startSession(pen) {
   live.delete(pen); // fresh counters: nothing inherited from any prior session
   return { session: sessionCode(id), started_at: now };
 }
+// A pen with a prototype runs scheduled sessions: the dashboard records the session and sends the start command;
+// the prototype confirms with its 'session' message and runs it on its own from then on.
+function startScheduled(pen) {
+  if (hub && !deviceConnected(pen)) throw Object.assign(new Error(`The prototype for ${pen} is not connected. Check that it is powered on and inlayo8.py is running.`), { code: 409 });
+  const test = testMode(), now = new Date().toISOString(), uid = 'dash-' + crypto.randomBytes(6).toString('hex');
+  const id = tx(db, () => {
+    if (q.active.get(pen)) throw Object.assign(new Error(`${pen} already has an active session.`), { code: 409 });
+    const sid = Number(sq.ins.run(pen, now, null, uid, test ? 1 : 0, null, null, null, 'starting', null).lastInsertRowid);
+    sessionStartRecord(pen, sid, now, { test }, 'Start sent to the prototype.');
+    return sid;
+  });
+  live.delete(pen);
+  sendToDevice(pen, { action: 'start', uid, pen, test, server_time: new Date().toISOString() });
+  return { session: sessionCode(id), started_at: now, scheduled: true, test };
+}
+// End early: ask the prototype (it evaluates what it has and sends no SMS). If it cannot be reached, or End is
+// pressed again while waiting, the session is closed on the dashboard; a later result from the prototype is still recorded.
+function endScheduled(s) {
+  const code = sessionCode(s.id);
+  if (s.state !== 'starting' && s.state !== 'stopping' && deviceConnected(s.pen_id)) {
+    sq.state.run('stopping', s.id);
+    sendToDevice(s.pen_id, { action: 'stop', uid: s.uid });
+    return { session: code, pending: true };
+  }
+  const cancelled = s.state === 'starting';
+  tx(db, () => closeActiveScheduled(s, cancelled ? 'cancelled' : 'ended_on_dashboard', cancelled ? 'Start cancelled on the dashboard.'
+    : 'Ended on the dashboard without a reply from the prototype. It may still be running this session; its result is recorded if it arrives.'));
+  sendToDevice(s.pen_id, { action: 'stop', uid: s.uid });
+  return { session: code, ended_at: new Date().toISOString() };
+}
 function endSession(pen) {
+  const active = q.active.get(pen);
+  if (active && active.kind === 'scheduled') return endScheduled(active);
   const now = new Date().toISOString();
   return tx(db, () => {
     const s = q.active.get(pen);
@@ -213,8 +515,8 @@ function endSession(pen) {
 function ackAlert(pen) {
   const now = new Date().toISOString();
   return tx(db, () => {
-    const s = q.active.get(pen);
-    if (!s || !s.alert_active) throw Object.assign(new Error('No unacknowledged alert for this pen.'), { code: 409 });
+    const s = alertedSession.get(pen); // the active session's alert, or an ended scheduled session's end-of-session alert
+    if (!s) throw Object.assign(new Error('No unacknowledged alert for this pen.'), { code: 409 });
     q.setAlert.run(0, s.id);
     q.insRecord.run(now, pen, s.id, 'Alert acknowledged', null, null, null, null, null);
     return { session: sessionCode(s.id) };
@@ -234,6 +536,7 @@ function ingest(b) {
   else if (typeof temp !== 'number' || !Number.isFinite(temp) || temp < 0 || temp > 60) throw bad('surface_temp_c must be a number in 0-60 °C or null.');
   const sess = q.active.get(b.pen_id);
   if (!sess) throw Object.assign(new Error('No active session for this pen; reading rejected.'), { code: 409 });
+  if (sess.kind === 'scheduled') throw Object.assign(new Error('This pen is running a scheduled session; live readings are not recorded.'), { code: 409 });
   if (tsMs < Date.parse(sess.started_at)) throw bad('Reading predates the active session; rejected.');
   const l = getLive(sess);
   if (l.tsMs !== null && tsMs <= l.tsMs) throw bad('Out-of-order or duplicate timestamp; rejected.');
@@ -282,15 +585,19 @@ function queryLog(u) {
   if (before && /^\d{1,12}$/.test(before)) { where.push('r.id < ?'); args.push(Number(before)); }
   const limit = Math.min(500, Math.max(1, Number(u.searchParams.get('limit')) || 100));
   const rows = db.prepare(`SELECT r.id, r.ts, r.pen_id, r.session_id, r.event_type, r.surface_temp_c, r.posture, r.lying_s,
-      r.screening_status, r.detail, r.evidence_path FROM records r ${where.length ? 'WHERE ' + where.join(' AND ') : ''}
+      r.screening_status, r.detail, r.evidence_path, r.seq, r.pig_id, r.behavioral_status, r.thermal_status FROM records r ${where.length ? 'WHERE ' + where.join(' AND ') : ''}
       ORDER BY r.id DESC LIMIT ?`).all(...args, limit);
   return rows.map((r) => ({ ...r, session: sessionCode(r.session_id), detail: r.detail ? JSON.parse(r.detail) : null }));
 }
 function listSessions() {
-  return db.prepare(`SELECT s.id, s.pen_id, s.started_at, s.ended_at, s.lying_s,
+  return db.prepare(`SELECT s.id, s.pen_id, s.started_at, s.ended_at, s.lying_s, s.kind, s.test, s.state, s.result,
       (SELECT COUNT(*) FROM records r WHERE r.session_id = s.id AND r.event_type = 'Measurement') AS measurements,
+      (SELECT COUNT(DISTINCT r.seq) FROM records r WHERE r.session_id = s.id AND r.event_type = 'Measurement' AND r.seq IS NOT NULL) AS captures,
       (SELECT COUNT(*) FROM records r WHERE r.session_id = s.id AND r.event_type = 'Alert') AS alerts
-      FROM sessions s ORDER BY s.id DESC LIMIT 200`).all().map((s) => ({ ...s, session: sessionCode(s.id) }));
+      FROM sessions s ORDER BY s.id DESC LIMIT 200`).all().map((s) => {
+    const r = parseJ(s.result);
+    return { ...s, test: !!s.test, result: r ? { pigs: r.pigs.length, flagged: r.flagged } : null, session: sessionCode(s.id) };
+  });
 }
 
 // ---- Optional camera preview (memory only; never touches the DB, never opens a camera)
@@ -334,7 +641,7 @@ function storeFrame(pen, kind, buf) {
   return true;
 }
 // ---- Static files (fixed whitelist; no user-controlled paths)
-const STATIC = { '/': ['index.html', 'text/html; charset=utf-8'], '/app.js': ['app.js', 'text/javascript; charset=utf-8'], '/style.css': ['style.css', 'text/css; charset=utf-8'] };
+const STATIC = { '/': ['index.html', 'text/html; charset=utf-8'], '/app.js': ['app.js', 'text/javascript; charset=utf-8'], '/style.css': ['style.css', 'text/css; charset=utf-8'], '/schedule.css': ['schedule.css', 'text/css; charset=utf-8'] };
 
 const server = http.createServer(async (req, res) => {
   try {
@@ -344,19 +651,22 @@ const server = http.createServer(async (req, res) => {
 
     if (m === 'GET' && p === '/api/status') {
       const now = Date.now();
-      return send(res, 200, { server_time: new Date(now).toISOString(), stale_after_s: cfg.stale_after_s, criteria: criteria(), pens: PENS.map((x) => { const v = penView(x, now); const d = dev.get(x); v.device = d && d.state ? { ...d.state, age_s: Math.round((now - d.at) / 1000) } : null; return v; }), registry: reg.all.all() });
+      return send(res, 200, { server_time: new Date(now).toISOString(), stale_after_s: cfg.stale_after_s, criteria: criteria(), test_mode: testMode(), scheduled: cfg.scheduled, pens: PENS.map((x) => { const v = penView(x, now); const d = dev.get(x); v.device = d && d.state ? { ...d.state, age_s: Math.round((now - d.at) / 1000) } : null; return v; }), registry: reg.all.all() });
     }
     const exp = /^\/api\/sessions\/SESSION-(\d{1,9})\/export\.(csv|pdf)$/.exec(p);
     if (m === 'GET' && exp) { // read-only download of one session's records
       const sid = Number(exp[1]);
-      const sess = db.prepare('SELECT id, pen_id, started_at, ended_at, lying_s FROM sessions WHERE id = ?').get(sid);
+      const sess = db.prepare('SELECT * FROM sessions WHERE id = ?').get(sid);
       if (!sess) return fail(res, 404, 'Session not found.');
       const code = sessionCode(sid);
-      const rows = db.prepare('SELECT ts, pen_id, event_type, surface_temp_c, posture, lying_s, screening_status, detail FROM records WHERE session_id = ? ORDER BY id').all(sid)
+      const rows = db.prepare(`SELECT ts, pen_id, event_type, surface_temp_c, posture, lying_s, screening_status, detail, seq, pig_id,
+          behavioral_status, thermal_status FROM records WHERE session_id = ?
+          ORDER BY CASE WHEN seq IS NULL THEN 1 ELSE 0 END, seq, IFNULL(pig_id, 0), id`).all(sid)
         .map((r) => ({ ...r, detail: r.detail ? JSON.parse(r.detail) : null }));
+      const meta = { ...sess, test: !!sess.test, result: parseJ(sess.result), sms: parseJ(sess.sms) };
       const csv = exp[2] === 'csv';
-      const body = csv ? Buffer.from(buildCsv(code, rows), 'utf8') : buildPdf(sess, code, rows);
-      res.writeHead(200, { 'Content-Type': csv ? 'text/csv; charset=utf-8' : 'application/pdf', 'Content-Disposition': `attachment; filename="${code}_${sess.pen_id}.${exp[2]}"`, 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff', 'Content-Security-Policy': CSP });
+      const body = csv ? Buffer.from(buildCsv(code, rows, meta), 'utf8') : buildPdf(meta, code, rows);
+      res.writeHead(200, { 'Content-Type': csv ? 'text/csv; charset=utf-8' : 'application/pdf', 'Content-Disposition': `attachment; filename="${code}_${sess.pen_id}${meta.test ? '_TEST' : ''}.${exp[2]}"`, 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff', 'Content-Security-Policy': CSP });
       return res.end(body);
     }
     if (m === 'GET' && p === '/api/discovered') return send(res, 200, discovered(req.headers.host));
@@ -397,8 +707,7 @@ const server = http.createServer(async (req, res) => {
       if (!PENS.includes(pen)) return fail(res, 404, 'Unknown pen.');
       const d = devGet(pen);
       if (devCmds) return send(res, 200, { ok: true, commands: d.cmds.splice(0) });
-      applyDevice(pen, await readJson(req));
-      return send(res, 200, { ok: true });
+      return send(res, 200, applyDevice(pen, await readJson(req, 262144)));
     }
     if (m === 'GET' && p === '/api/device/events') {
       const pen = u.searchParams.get('pen') || '';
@@ -420,6 +729,14 @@ const server = http.createServer(async (req, res) => {
         await hub.sendCommand(dv, cmd);
       } else { const d = devGet(cmdPost[1]); d.cmds.push(cmd); if (d.cmds.length > 10) d.cmds.shift(); } // legacy: picked up by tools/mqtt_bridge.py
       return send(res, 200, { ok: true });
+    }
+
+    if (m === 'POST' && p === '/api/settings/test-mode') { // global: applies to sessions started from now on
+      if (!sameOriginUi(req)) return fail(res, 403, 'Request rejected (missing or cross-origin request header).');
+      const b = await readJson(req);
+      if (typeof b.enabled !== 'boolean') return fail(res, 422, 'enabled must be true or false.');
+      sq.setSetting.run('test_mode', b.enabled ? '1' : '0');
+      return send(res, 200, { ok: true, test_mode: testMode() });
     }
 
     // ---- Pen registry (dashboard-managed pens)
@@ -455,10 +772,13 @@ const server = http.createServer(async (req, res) => {
     if (m === 'DELETE' && sesDel) { // deletes an ended session together with all of its log records
       if (!sameOriginUi(req)) return fail(res, 403, 'Request rejected (missing or cross-origin request header).');
       const id = Number(sesDel[1]);
-      const s = db.prepare('SELECT id, pen_id, ended_at FROM sessions WHERE id = ?').get(id);
+      const s = db.prepare('SELECT * FROM sessions WHERE id = ?').get(id);
       if (!s) return fail(res, 404, 'Session not found.');
       if (s.ended_at === null) return fail(res, 409, 'End the session before deleting it.');
-      tx(db, () => { db.prepare('DELETE FROM records WHERE session_id = ?').run(id); db.prepare('DELETE FROM sessions WHERE id = ?').run(id); });
+      tx(db, () => {
+        if (s.uid) sq.markDeleted.run(s.uid, new Date().toISOString()); // the prototype re-announces finished sessions; do not re-create it
+        db.prepare('DELETE FROM records WHERE session_id = ?').run(id); db.prepare('DELETE FROM sessions WHERE id = ?').run(id);
+      });
       const l = live.get(s.pen_id); if (l && l.sid === id) live.delete(s.pen_id);
       return send(res, 200, { ok: true });
     }
@@ -522,6 +842,8 @@ if (cfg.mqtt.enabled) {
     },
     onState: (pen, s) => applyDevice(pen, { state: s }),
     onEvent: (pen, ev) => applyDevice(pen, { event: ev }),
+    onSession: (pen, msg) => { try { onSession(pen, msg); } catch (e) { quiet(`${pen}/session/${e.code}`, `[mqtt] ${pen}: session message rejected (${e.code || 500}): ${e.message}`); } },
+    onSample: (pen, msg) => { try { onSample(pen, msg); } catch (e) { quiet(`${pen}/sample/${e.code}`, `[mqtt] ${pen}: capture rejected (${e.code || 500}): ${e.message}`); } },
     onPreview: (pen, kind, buf) => storeFrame(pen, kind, buf),
     onUnknown: noteUnknown,
   }).then((h) => {

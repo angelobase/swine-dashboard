@@ -61,3 +61,20 @@ The dashboard consumes these values to:
 - Requests are rejected when the timestamp is invalid, the pen is unknown, the session is inactive, or the reading is outside the accepted ranges.
 
 This contract is intentionally conservative and matches the existing dashboard implementation without inventing a richer pipeline API.
+
+## Scheduled sessions (prototype over MQTT)
+Pens added with a prototype run scheduled sessions; `/api/ingest` readings are refused for them. Messages
+(base `swine/<device_id>`), all JSON:
+
+- `session` (retained, on every change and every 30 s): `uid`, `state` (running | evaluating | finished | ended_early |
+  abandoned), `test`, `started_at`, `ends_at`, `interval_s`, `duration_s`, `captures`, `next_seq`, `last_seq`,
+  `next_capture_at`, `capturing`, `stopping`, `clock_source`, `rule`, `ended_at`, `result` (per pig: longest lying,
+  final temperature, statuses, `alert`), `sms` (`state`, `detail`, `time`).
+- `sample` (one per capture): `uid`, `seq` (0-based), `ts`, `ok`, `error`, `thermal_valid`, `calibrated`, `images`,
+  `pigs` (per pig: `pig_id`, `observed`, `posture`, `lying_s`, `surface_temp_c`, `behavioral_status`, `thermal_status`).
+- `cmd` (dashboard -> Pi): `{"action": "start", "uid", "pen", "test", "server_time"}`, `{"action": "stop", "uid"}`,
+  `{"action": "replay", "uid", "seqs": [...]}`.
+
+The dashboard stores one `Measurement` record per pig per capture (columns `seq`, `pig_id`, `behavioral_status`,
+`thermal_status` added by migration), deduplicated, so replays are safe. Times come from the Pi, corrected at start.
+The loopback route `POST /api/device/<PEN>` also accepts `{"session": ...}` and `{"sample": ...}` for testing.

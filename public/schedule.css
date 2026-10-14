@@ -1,0 +1,12 @@
+/* Test mode and scheduled-session tile content. Loaded by app.js; style.css and index.html are unchanged.
+   Text colour is inherited, so it follows the existing light and dark styling. Amber marks "test", as a caution colour. */
+.tm-btn[aria-pressed="true"] { background: #b45309; border-color: #b45309; color: #fff; }
+.test-banner { margin: 0 0 .5rem; padding: .45rem .75rem; border-left: 4px solid #b45309; background: rgba(217, 119, 6, .14); font-size: .9rem; }
+.chip.test { background: #b45309; color: #fff; }
+
+.tile table.pigs { border-collapse: collapse; font-size: .75rem; margin: .25rem 0; max-width: 100%; }
+.tile table.pigs th, .tile table.pigs td { padding: .05rem .6rem .05rem 0; text-align: left; white-space: nowrap; font-weight: normal; }
+.tile table.pigs th { opacity: .75; }
+.tile table.pigs tr.warn td { font-weight: 700; }
+.tile table.pigs tr.dim td { opacity: .6; }
+@media (max-width: 600px) { .tile table.pigs th:nth-child(n+5), .tile table.pigs td:nth-child(n+5) { display: none; } }
