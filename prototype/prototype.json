@@ -1,7 +1,7 @@
 {
   "device_id": "",
   "advertise_host": "",
-  "mqtt": { "host": "192.168.1.10", "port": 1883, "username": "swine", "password": "change-me" },
+  "mqtt": { "host": "auto", "port": 1883, "username": "swine", "password": "change-me" },
   "high_temperature_threshold_c": 35.0,
   "behavior_confirmation_s": 1.0,
   "reading_interval_s": 5,

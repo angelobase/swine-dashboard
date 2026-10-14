@@ -1,0 +1,12 @@
+Extract all four Python files into /home/group4/baboy/YOLO/prototype/ beside inlayo8.py.
+Keep existing inlayo8.py, prototype.json, hub_discovery.py and ONNX model.
+Stop the controller before copying; restart afterward.
+Run: /home/group4/baboy/bin/python3 -u inlayo8.py
+Logs: camera_logs/yolo.log and camera_logs/thermal.log
+Previews: camera_logs/preview/rgb.jpg and thermal.jpg
+These workers remove local windows and publish the controller-compatible metrics and JPEG files.
+Original SPI packet acquisition and ONNX detection/tracking logic retained.
+One camera at a time, controlled by existing inlayo8.py.
+Behavior flag retains the ORIGINAL abnormal-class logic. This package does NOT implement a new prolonged-lying threshold.
+Temperature plausibility does not verify TLinear mode; configure the sensor correctly.
+Static checks only: real Pi, sensors, ONNX model and dashboard integration require hardware verification.
