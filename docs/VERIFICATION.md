@@ -162,3 +162,8 @@ startup; a sessions
 - **Not verified:** the real aedes broker was not installed here; the test ran against a minimal stand-in with the same
   interface. Run `node tools/ws_test.js` after `npm install` to check against the real aedes. Also not verified: real
   paho-mqtt over WebSockets, and Render itself.
+
+## Missing disk on Render (2026-10-15)
+Reported: `EACCES: permission denied, mkdir '/var/data'` at startup on Render (no disk mounted at the `SWINE_DB`
+folder). `server.js` now exits with a plain explanation instead of a stack trace; checked by forcing the folder
+creation to fail (with and without the `RENDER` variable). `node tools/schedule_test.js`: 63 passed.

@@ -15,7 +15,16 @@ if (nodeVersion[0] < 22 || (nodeVersion[0] === 22 && (nodeVersion[1] || 0) < 13)
   process.exit(1);
 }
 
-fs.mkdirSync(path.dirname(cfg.db_path), { recursive: true });
+try {
+  fs.mkdirSync(path.dirname(cfg.db_path), { recursive: true });
+} catch (e) {
+  const folder = path.dirname(cfg.db_path);
+  console.error(`[error] Cannot create the database folder ${folder} (${e.code}).\n` +
+    (process.env.RENDER ? `On Render this means no disk is mounted at ${folder}: add a disk with mount path ${folder} (paid instance types), ` +
+      'or remove the SWINE_DB variable to use a temporary database that is erased on every restart and deploy.'
+      : 'Check the SWINE_DB setting and that this folder can be created.'));
+  process.exit(1);
+}
 const db = open(cfg.db_path);
 
 // ---- Pen registry: which pens are shown on the dashboard, with the prototype address and optional camera URL

@@ -404,7 +404,16 @@ python tools/test_push.py --host wss://<your-app>.onrender.com/mqtt --password <
 
 It needs `paho-mqtt`. `--http` mode does not work with Render: it only reaches a dashboard on the same computer.
 
-### 5.5 Good to know
+### 5.5 Troubleshooting
+
+| Log message | Cause and fix |
+|---|---|
+| `Cannot create the database folder /var/data` (or `EACCES ... mkdir '/var/data'`) | No disk is mounted at `/var/data`. Add a disk with mount path exactly `/var/data` (paid instance types), then redeploy. For a quick trial without a disk, delete the `SWINE_DB` variable: the database is then erased on every restart and deploy. |
+| `Invalid header flag bits, must be 0x0 for puback packet` | `HOST` is not `0.0.0.0`, so Render sends web traffic to the MQTT port. |
+| `WebSockets off: set an MQTT password` | `MQTT_PASS` is missing. |
+| `WebSockets off: the 'ws' package is not installed` | Run `npm install ws@8` locally, commit `package.json` and `package-lock.json`, push. |
+
+### 5.6 Good to know
 
 - Render closes WebSocket connections when it restarts or redeploys the service. The Pi reconnects by itself and the dashboard fetches any captures it missed, so redeploying during a session loses no data. Avoid it anyway during a 19-hour run.
 - Keep the service at **one instance**: the MQTT broker runs inside it (a disk already limits it to one).
