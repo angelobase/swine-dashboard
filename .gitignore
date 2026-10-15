@@ -1,5 +1,6 @@
 # ---- Web app
 node_modules/
+prototype/
 # study data (swine.db), never committed
 data/
 *.db
