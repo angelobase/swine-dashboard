@@ -68,7 +68,8 @@ cp prototype.example.json prototype.json
 
 | Setting | Set it to |
 |---|---|
-| `mqtt.password` | the same password as `mqtt.password` in the dashboard's `config.json` |
+| `mqtt.host` | `auto` (find the dashboard on the local network), or `wss://<your-app>.onrender.com/mqtt` for a dashboard on Render (section 5) |
+| `mqtt.password` | the same password as `mqtt.password` in the dashboard's `config.json` (on Render: the `MQTT_PASS` variable) |
 | `gsm.recipient` | the phone number that receives the alert, e.g. `+639...` |
 | `screening.abnormal_lying_consecutive_captures` | the number of captures your study cites (**6 is a placeholder**) |
 | `screening.temperature_threshold_c` | `36.7` |
@@ -272,7 +273,7 @@ Pressing **End** early ends the session on the Pi. The pigs are evaluated, but n
 
 GitHub stores the code. Each computer gets the code from GitHub and runs it **locally**: the dashboard computer runs the web app, and the Pi runs the prototype.
 
-The web app cannot be hosted on GitHub Pages or a cloud service:
+The web app cannot be hosted on GitHub Pages. (For a cloud host such as Render, see section 5.) In general:
 
 - **GitHub Pages only serves static pages.** The web app needs a running Node.js server and a database file.
 - **The Pi finds the dashboard by a broadcast on the local network** and connects on TCP port 1883. Neither works across the internet, and the farm network may have no internet at all.
@@ -340,3 +341,71 @@ Your local files (`config.json`, `prototype.json`, `calibration.json`, the datab
 ### 4.7 Automatic tests on GitHub
 
 `.github/workflows/tests.yml` runs `node tools/schedule_test.js` and the prototype tests on GitHub after every push. No hardware or secrets are needed. Results appear in the repository's **Actions** tab; a red mark means a change broke something, so do not deploy that version.
+
+---
+
+## 5. Hosting the web app on Render
+
+On Render, the Pi connects with **MQTT over secure WebSockets** (`wss://<your-app>.onrender.com/mqtt`), because Render only forwards its HTTPS port. The dashboard asks for a login, because it is reachable from the internet.
+
+### 5.1 Before deploying (on your computer)
+
+```bash
+npm install ws@8                 # MQTT over WebSockets; adds it to package.json
+npm install aedes@1.2.0          # only if package.json does not list aedes yet
+node tools/ws_test.js            # expected: "21 passed, 0 failed"
+```
+
+Commit `package.json` and `package-lock.json`, and push to GitHub.
+
+### 5.2 Render settings
+
+Create a **Web Service** from your GitHub repository.
+
+| Setting | Value |
+|---|---|
+| Build command | `npm ci` (or `npm install` without a `package-lock.json`) |
+| Start command | `npm start` |
+| Instance type | a paid instance: the free type has no persistent disk and sleeps after 15 minutes |
+| Disk | mount path `/var/data`, 1 GB is plenty |
+| Health check path | `/healthz` |
+
+**Environment variables:**
+
+| Variable | Value |
+|---|---|
+| `HOST` | `0.0.0.0` |
+| `NODE_VERSION` | `22.13.0` or newer (or set `engines` in `package.json`) |
+| `SWINE_DB` | `/var/data/swine.db` (the database on the disk; without it, data is lost on every restart) |
+| `MQTT_PASS` | a long random password. Required: without it MQTT over WebSockets stays off |
+| `MQTT_TCP` | `0` (port 1883 is not reachable on Render) |
+| `MQTT_BEACON` | `0` (local-network discovery does not work on Render) |
+| `DASHBOARD_USER` | the login name for the dashboard, e.g. `admin` |
+| `DASHBOARD_PASSWORD` | a strong password. Without it, anyone with the link can see and change the data |
+| `SWINE_CONFIG_JSON` | `{"pens":[],"preview":{"enabled":true}}` (replaces `config.json`, which is not on Render) |
+
+After deploying, the log should show `Login required (user "admin")` and `MQTT broker: TCP off; WebSockets on at path /mqtt`. Open `https://<your-app>.onrender.com`; the browser asks for the login.
+
+### 5.3 Connect the Pi
+
+In `prototype/prototype.json` on the Pi:
+
+```json
+"mqtt": { "host": "wss://<your-app>.onrender.com/mqtt", "port": 1883, "username": "swine", "password": "<same as MQTT_PASS>" }
+```
+
+(`port` is ignored for `wss://` addresses, which use 443.) The Pi needs internet access. Run `python3 inlayo8.py`, then in the dashboard use **+ > Add a pen** and pick the prototype from the list.
+
+### 5.4 Test with the simulator (no Pi)
+
+```bash
+python tools/test_push.py --host wss://<your-app>.onrender.com/mqtt --password <MQTT_PASS>
+```
+
+It needs `paho-mqtt`. `--http` mode does not work with Render: it only reaches a dashboard on the same computer.
+
+### 5.5 Good to know
+
+- Render closes WebSocket connections when it restarts or redeploys the service. The Pi reconnects by itself and the dashboard fetches any captures it missed, so redeploying during a session loses no data. Avoid it anyway during a 19-hour run.
+- Keep the service at **one instance**: the MQTT broker runs inside it (a disk already limits it to one).
+- The Pi still sends the SMS itself, even if Render or the farm's internet is down.

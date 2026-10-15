@@ -147,3 +147,18 @@ the dashboard showed "Waiting for prototype". Cause: the same prototype was adde
 address skipped the duplicate check), so starts went out through one pen and replies came back through the other.
 Fixed in `server.js`: adding a prototype already used by another pen is refused; existing duplicates are reported at
 startup; a sessions
+
+## MQTT over WebSockets and dashboard login, for Render (2026-10-15)
+- Dashboard: the built-in broker also accepts MQTT over WebSockets at `/mqtt` on the web port; it is only enabled
+  with an MQTT password. Optional login (HTTP Basic) via `DASHBOARD_PASSWORD`; `/healthz` stays open. Settings from
+  environment variables (`SWINE_CONFIG_JSON`, `MQTT_TCP`, `MQTT_WS_PATH`, `MQTT_USER`, `DASHBOARD_USER`).
+- Pi: `mqtt.host` accepts `wss://<host>/mqtt` (also `ws://`, `mqtt://`, `mqtts://`).
+- `node tools/ws_test.js` (21 checks, passed 3 runs in a row): real server with settings from environment variables,
+  real `ws` 8.20 WebSocket with MQTT 3.1.1 packets written byte for byte; login and health route; wrong path and wrong
+  MQTT password refused; connect, Add-a-pen discovery, start and stop commands delivered, session, capture and image
+  recorded, publishing as another device refused. Negative control: with no MQTT password the WebSocket path stays
+  off and the test fails as expected.
+- Pi tests (17): `wss://` address parsing; paho client set up with WebSocket transport, path `/mqtt`, TLS, port 443.
+- **Not verified:** the real aedes broker was not installed here; the test ran against a minimal stand-in with the same
+  interface. Run `node tools/ws_test.js` after `npm install` to check against the real aedes. Also not verified: real
+  paho-mqtt over WebSockets, and Render itself.

@@ -12,6 +12,7 @@ Two ways to connect:
     It appears in the dashboard under "+ > Add a pen" as sim-xxxxxx. Add it, then use Start, Start test, End and the
     Test mode button exactly as with the Pi. Options: --host <dashboard IP> if auto-discovery does not find it,
     --password <mqtt password> if config.json sets one.
+    Dashboard on Render:  python3 tools/test_push.py --host wss://<your-app>.onrender.com/mqtt --password <MQTT_PASS>
 
   HTTP (like the old test_push.py; run it on the dashboard computer, no MQTT needed):
       python3 tools/test_push.py --http PEN-01
@@ -55,10 +56,35 @@ for candidate in (HERE, HERE.parent / 'prototype'):
         break
 else:
     sys.exit('Cannot find inlayo8.py. Keep test_push.py in tools/ next to the prototype/ folder, or inside prototype/.')
+
+# Each prototype file must contain its own code; a file pasted into the wrong name breaks the import.
+EXPECTED = {'inlayo8.py': 'class Prototype', 'pi_store.py': 'class Store', 'screening.py': 'def evaluate(',
+            'pig_ids.py': 'def assign(', 'capture_once.py': 'def annotate_rgb(', 'yolo_worker.py': 'class YoloOnnxDetector',
+            'thermal_worker.py': 'class Lepton3', 'gsm_sms.py': 'def read_response(', 'preview_support.py': 'def save_preview('}
+problems = []
+for name, marker in EXPECTED.items():
+    f = PROTO / name
+    if not f.is_file():
+        problems.append(f'{name}: missing')
+        continue
+    text = f.read_text(encoding='utf-8', errors='replace')
+    if marker not in text:
+        owner = next((n for n, m in EXPECTED.items() if n != name and m in text), None)
+        problems.append(f'{name}: wrong content ({f.stat().st_size} bytes)' + (f'; it contains the code of {owner}' if owner else ''))
+if problems:
+    sys.exit(f'Some files in {PROTO} are missing or have the wrong content:\n  ' + '\n  '.join(problems) +
+             '\nExtract the update zip and copy its whole prototype folder over yours (yolo_worker.py, thermal_worker.py,'
+             '\ngsm_sms.py and preview_support.py are your own files from the Pi).')
 sys.path.insert(0, str(PROTO))
 import capture_once as co  # noqa: E402  (image drawing and JPEG writing; no camera is opened)
 import inlayo8  # noqa: E402
 import pig_ids  # noqa: E402
+
+if not hasattr(inlayo8, 'Prototype') or not hasattr(inlayo8, 'send_with_retries'):
+    found = Path(getattr(inlayo8, '__file__', None) or '(not a file)')
+    size = found.stat().st_size if found.is_file() else 0
+    sys.exit(f'The inlayo8.py that was loaded is not the scheduled-session version:\n  {found}  ({size} bytes)\n'
+             f'Copy prototype/inlayo8.py from the update into {PROTO}, then run this again.')
 
 FRAME_W, FRAME_H = 640, 480
 
@@ -247,7 +273,7 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--http', metavar='PEN', help='post to the dashboard over HTTP as this pen instead of using MQTT')
     ap.add_argument('--dashboard', default='http://127.0.0.1:8080', help='dashboard address for --http')
-    ap.add_argument('--host', help='dashboard IP for MQTT (default: find it automatically)')
+    ap.add_argument('--host', help='dashboard for MQTT: an IP address, or wss://<app>.onrender.com/mqtt (default: find it on the local network)')
     ap.add_argument('--password', help='MQTT password (default: from prototype.json)')
     ap.add_argument('--device', help='device id (default: sim-<from this computer>)')
     ap.add_argument('--start', action='store_true', help='MQTT mode: start a full session now')

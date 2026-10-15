@@ -657,6 +657,31 @@ function storeFrame(pen, kind, buf) {
   frames.set(`${pen}/${kind}`, { buf: Buffer.from(buf), at: Date.now() });
   return true;
 }
+// ---- Optional login (browser username/password prompt, HTTP Basic). On when auth.password / DASHBOARD_PASSWORD is set.
+// Needed when the dashboard is reachable from the internet (e.g. Render, which adds HTTPS). /healthz stays open for health checks.
+const AUTH = cfg.auth.password ? Buffer.from('Basic ' + Buffer.from(`${cfg.auth.user}:${cfg.auth.password}`, 'utf8').toString('base64')) : null;
+const MACHINE_ROUTE = /^\/api\/(ingest|device\/[A-Za-z0-9_-]+(\/commands)?|preview\/[A-Za-z0-9_-]+\/(rgb|thermal))$/; // the Pi / tools on this computer
+const authFails = new Map();
+const clientIp = (req) => String(req.headers['x-forwarded-for'] || '').split(',').map((x) => x.trim()).filter(Boolean).pop() || req.socket.remoteAddress || '?';
+function loginOk(req) {
+  const got = Buffer.from(String(req.headers.authorization || ''));
+  return got.length === AUTH.length && crypto.timingSafeEqual(got, AUTH);
+}
+function needLogin(req, res, p) {
+  if (!AUTH || loginOk(req)) return false;
+  if (isLoopback(req.socket.remoteAddress || '') && MACHINE_ROUTE.test(p)) return false; // these routes have their own loopback/token checks
+  const ip = clientIp(req), now = Date.now();
+  const f = authFails.get(ip) || { n: 0, t: now };
+  if (now - f.t > 60000) { f.n = 0; f.t = now; }
+  if (f.n >= 20) { fail(res, 429, 'Too many failed logins. Wait a minute and try again.'); return true; }
+  if (req.headers.authorization) f.n++;
+  if (authFails.size > 1000) authFails.clear();
+  authFails.set(ip, f);
+  res.writeHead(401, { 'WWW-Authenticate': 'Basic realm="Swine dashboard", charset="UTF-8"', 'Content-Type': 'text/plain; charset=utf-8', 'Cache-Control': 'no-store' });
+  res.end('Login required.');
+  return true;
+}
+
 // ---- Static files (fixed whitelist; no user-controlled paths)
 const STATIC = { '/': ['index.html', 'text/html; charset=utf-8'], '/app.js': ['app.js', 'text/javascript; charset=utf-8'], '/style.css': ['style.css', 'text/css; charset=utf-8'], '/schedule.css': ['schedule.css', 'text/css; charset=utf-8'] };
 
@@ -664,6 +689,8 @@ const server = http.createServer(async (req, res) => {
   try {
     const u = new URL(req.url, 'http://localhost');
     const p = u.pathname; const m = req.method;
+    if (m === 'GET' && p === '/healthz') return send(res, 200, { ok: true });
+    if (needLogin(req, res, p)) return;
     if (m === 'GET' && STATIC[p]) return send(res, 200, fs.readFileSync(path.join(__dirname, 'public', STATIC[p][0])), STATIC[p][1]);
 
     if (m === 'GET' && p === '/api/status') {
@@ -827,7 +854,8 @@ const server = http.createServer(async (req, res) => {
 
 server.listen(cfg.port, cfg.host, () => {
   console.log(`Swine dashboard listening on http://${cfg.host}:${cfg.port}`);
-  console.log(`Bound address: ${cfg.host}:${cfg.port}. No authentication or encryption is configured; access from other devices is only enabled when HOST is set to the LAN interface or config.json host is changed explicitly.`);
+  console.log(AUTH ? `Bound address: ${cfg.host}:${cfg.port}. Login required (user "${cfg.auth.user}").`
+    : `Bound address: ${cfg.host}:${cfg.port}. No login is configured (set DASHBOARD_PASSWORD to require one); access from other devices is only enabled when HOST is set to the LAN interface or config.json host is changed explicitly.`);
   console.log(`DB: ${cfg.db_path} | live-reading pens threshold: ${SC.surface_temp_threshold_c === null ? 'not configured' : SC.surface_temp_threshold_c + ' °C'} | pens with a prototype use the rule in prototype.json`);
 });
 // ---- Devices that connected but are not yet a pen (offered in the Add-pen dialog)
@@ -854,7 +882,7 @@ const warnAt = new Map();
 const quiet = (key, msg) => { const t = Date.now(); if (t - (warnAt.get(key) || 0) > 60000) { warnAt.set(key, t); console.log(msg); } };
 if (cfg.mqtt.enabled) {
   createHub({
-    mqtt: cfg.mqtt, resolve: (d) => devToPen.get(d) || null,
+    mqtt: cfg.mqtt, httpServer: server, resolve: (d) => devToPen.get(d) || null,
     onReading: (pen, r) => {
       try { ingest({ pen_id: pen, timestamp: new Date().toISOString(), surface_temp_c: r.surface_temp_c, posture: r.posture || 'Unknown' }); } // arrival time: Pi clock drift cannot reject data
       catch (e) { quiet(`${pen}/${e.code}`, `[mqtt] ${pen}: reading rejected (${e.code || 500}): ${e.message}`); }
@@ -867,8 +895,9 @@ if (cfg.mqtt.enabled) {
     onUnknown: noteUnknown,
   }).then((h) => {
     hub = h;
-    if (cfg.mqtt.beacon) beacon = startBeacon({ port: cfg.mqtt.discovery_port, mqttPort: cfg.mqtt.port, requireAuth: h.requireAuth });
-    console.log(`MQTT broker listening on ${cfg.mqtt.host}:${cfg.mqtt.port} (${h.requireAuth ? `login required, user "${cfg.mqtt.username}"` : 'OPEN: no password set; use only on a trusted network'}). Do not also run tools/mqtt_bridge.py or Mosquitto.`);
+    if (cfg.mqtt.beacon && h.tcp) beacon = startBeacon({ port: cfg.mqtt.discovery_port, mqttPort: cfg.mqtt.port, requireAuth: h.requireAuth });
+    console.log(`MQTT broker: TCP ${h.tcp ? `${cfg.mqtt.host}:${cfg.mqtt.port}` : 'off'}; WebSockets ${h.websocket}; ` +
+      `${h.requireAuth ? `login required, user "${cfg.mqtt.username}"` : 'OPEN: no password set; use only on a trusted network'}. Do not also run tools/mqtt_bridge.py or Mosquitto.`);
   }).catch((e) => { console.error(`[error] MQTT broker is NOT running: ${e.message}. (If the port is busy, stop Mosquitto or change mqtt.port; to turn the broker off set mqtt.enabled=false or MQTT_ENABLED=0.) The dashboard itself keeps running.`); });
 }
 const shutdown = () => server.close(async () => { if (beacon) beacon.close(); if (hub) await hub.close(); db.close(); process.exit(0); });

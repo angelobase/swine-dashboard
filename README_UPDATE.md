@@ -16,6 +16,7 @@ lib/beacon.js, public/index.html, public/style.css.
 | public/app.js | replaced |
 | public/schedule.css | new (loaded by app.js) |
 | tools/schedule_test.js | new |
+| tools/ws_test.js | new: MQTT over WebSockets + login test (needs npm install ws@8) |
 | tools/test_push.py | replaced: now a dummy prototype (see docs/SCHEDULED_SESSIONS.md); add tools/sim_data/ to .gitignore |
 | .gitignore, .gitattributes, .github/workflows/tests.yml | new: for GitHub (see README_INSTRUCTION.md section 4); hidden files, copy them too |
 | config.example.json, prototype/prototype.example.json | new: settings templates committed instead of config.json / prototype.json |
