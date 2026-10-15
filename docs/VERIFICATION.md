@@ -140,3 +140,10 @@ Linux workstation, Node v22.22.2, Python 3 with numpy and OpenCV. No Raspberry P
 - `inlayo8.py` and `capture_once.py` now import `fcntl` inside the functions that use it, so they load on Windows.
 - Not verified: the simulator's MQTT mode (paho-mqtt and the aedes broker were not installed here), and running it
   on Windows.
+
+## One prototype on two pens (2026-10-15)
+Reported: `session message rejected (409): Session ... belongs to PEN-02` and the prototype refusing a start while
+the dashboard showed "Waiting for prototype". Cause: the same prototype was added to two pens (a typed or pasted
+address skipped the duplicate check), so starts went out through one pen and replies came back through the other.
+Fixed in `server.js`: adding a prototype already used by another pen is refused; existing duplicates are reported at
+startup; a sessions

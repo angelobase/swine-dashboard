@@ -1,1 +1,30 @@
+# ---- Web app
 node_modules/
+# study data (swine.db), never committed
+data/
+*.db
+*.db-wal
+*.db-shm
+# local settings incl. the MQTT password: copy config.example.json to config.json
+config.json
+.env
+
+# ---- Prototype (Raspberry Pi)
+# MQTT password and phone number: copy prototype/prototype.example.json to prototype/prototype.json
+prototype/prototype.json
+# belongs to one camera mounting
+prototype/calibration.json
+# the Pi's local session log, capture images and logs
+prototype/pi_data/
+prototype/camera_logs/
+prototype/prototype_address.txt
+prototype/.venv/
+# test_push.py simulator data
+tools/sim_data/
+
+# ---- Python
+__pycache__/
+*.pyc
+
+# ---- Model: remove the # on the next line to keep the model out of git (files over 100 MB need Git LFS)
+# *.onnx

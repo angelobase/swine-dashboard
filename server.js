@@ -40,7 +40,14 @@ for (const r of reg.all.all()) if (!PENS.includes(r.pen_id)) PENS.push(r.pen_id)
 let devToPen = new Map(); let penToDev = new Map();
 function rebuildDeviceMap() {
   devToPen = new Map(); penToDev = new Map();
-  for (const r of reg.all.all()) { const d = deviceFromAddress(r.address); if (d) { devToPen.set(d, r.pen_id); penToDev.set(r.pen_id, d); } }
+  for (const r of reg.all.all()) {
+    const d = deviceFromAddress(r.address);
+    if (!d) continue;
+    if (devToPen.has(d)) { // one prototype on two pens: its messages can only go to one of them
+      console.error(`[warning] Prototype ${d} is added to both ${devToPen.get(d)} and ${r.pen_id}. Its data goes to ${devToPen.get(d)}; remove one of the two pens.`);
+    } else devToPen.set(d, r.pen_id);
+    penToDev.set(r.pen_id, d);
+  }
 }
 rebuildDeviceMap();
 
@@ -227,7 +234,7 @@ function recordEvaluation(s, m, adopted = false) {
 function onSession(pen, raw) {
   const m = cleanSession(raw);
   let s = sq.byUid.get(m.uid);
-  if (s && s.pen_id !== pen) throw unprocessable(`Session ${m.uid} belongs to ${s.pen_id}.`, 409);
+  if (s && s.pen_id !== pen) quiet(`moved/${m.uid}`, `[mqtt] Session ${m.uid} was started on ${s.pen_id}; the prototype now reports as ${pen}. Its data stays with ${s.pen_id}.`);
   if (!s) {
     if (sq.deleted.get(m.uid)) return { ignored: 'deleted on the dashboard' };
     const terminal = SCHED_TERMINAL.has(m.state);
@@ -264,6 +271,7 @@ function onSession(pen, raw) {
       }
     }
   }
+  if (s.ended_at && m.state === 'running' && ['cancelled', 'ended_on_dashboard'].includes(s.state)) stopOrphan(pen, s.uid);
   requestReplay(pen, sq.byId.get(s.id), m.info.last_seq);
   return { session: sessionCode(s.id) };
 }
@@ -272,7 +280,7 @@ function onSample(pen, b) {
   if (!UID_RE.test(b.uid || '')) throw unprocessable('Sample without a valid session id.');
   const s = sq.byUid.get(b.uid);
   if (!s) throw unprocessable('Sample for a session the dashboard does not know yet.', 409);
-  if (s.pen_id !== pen) throw unprocessable(`Session ${b.uid} belongs to ${s.pen_id}.`, 409);
+  pen = s.pen_id; // captures stay with the pen the session started on
   if (!Number.isInteger(b.seq) || b.seq < 0 || b.seq > 100000) throw unprocessable('seq must be a non-negative integer.');
   const ts = isoOrNull(b.ts);
   if (!ts) throw unprocessable('A valid capture timestamp is required.');
@@ -329,7 +337,16 @@ function sendToDevice(pen, cmd) {
 }
 function refuseStart(pen, uid, detail) {
   const s = sq.byUid.get(uid);
-  if (s && s.pen_id === pen && !s.ended_at && s.state === 'starting') closeActiveScheduled(s, 'refused', `Prototype refused the start: ${detail}`);
+  if (s && !s.ended_at && s.state === 'starting') closeActiveScheduled(s, 'refused', `Prototype refused the start: ${detail}`);
+}
+// The prototype keeps running a session that was ended on the dashboard while it was unreachable: ask it to stop
+// (it evaluates what it has and sends no SMS). At most every 15 s per session.
+const stopAt = new Map();
+function stopOrphan(pen, uid) {
+  const now = Date.now();
+  if (now - (stopAt.get(uid) || 0) < 15000) return;
+  stopAt.set(uid, now);
+  sendToDevice(pen, { action: 'stop', uid });
 }
 
 function schedView(s, nowMs) {
@@ -755,6 +772,8 @@ const server = http.createServer(async (req, res) => {
       if (!/^\S{1,200}$/.test(address)) return fail(res, 422, 'Prototype address is required (no spaces).');
       if (camera && !/^https?:\/\/\S{1,500}$/i.test(camera)) return fail(res, 422, 'Camera URL must start with http:// or https://');
       if (reg.get.get(pen)) return fail(res, 409, `${pen} is already on the dashboard.`);
+      const dev = deviceFromAddress(address);
+      if (dev && devToPen.has(dev)) return fail(res, 409, `That prototype (${dev}) is already used by ${devToPen.get(dev)}. Remove that pen first to move it.`);
       reg.ins.run(pen, address, camera, new Date().toISOString());
       if (!PENS.includes(pen)) PENS.push(pen);
       rebuildDeviceMap();
@@ -809,7 +828,7 @@ const server = http.createServer(async (req, res) => {
 server.listen(cfg.port, cfg.host, () => {
   console.log(`Swine dashboard listening on http://${cfg.host}:${cfg.port}`);
   console.log(`Bound address: ${cfg.host}:${cfg.port}. No authentication or encryption is configured; access from other devices is only enabled when HOST is set to the LAN interface or config.json host is changed explicitly.`);
-  console.log(`DB: ${cfg.db_path} | screening threshold: ${SC.surface_temp_threshold_c === null ? 'NOT configured (no alerts will fire)' : SC.surface_temp_threshold_c + ' °C'}`);
+  console.log(`DB: ${cfg.db_path} | live-reading pens threshold: ${SC.surface_temp_threshold_c === null ? 'not configured' : SC.surface_temp_threshold_c + ' °C'} | pens with a prototype use the rule in prototype.json`);
 });
 // ---- Devices that connected but are not yet a pen (offered in the Add-pen dialog)
 const seen = new Map(); // device id -> { ip, at }

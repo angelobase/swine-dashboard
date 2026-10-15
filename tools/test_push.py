@@ -238,6 +238,7 @@ def build_config(args):
     cfg['test'] = {'interval_s': args.test_interval, 'duration_s': args.test_duration, 'send_sms': True}
     cfg['screening']['abnormal_lying_consecutive_captures'] = args.rule
     cfg['gsm'].update(enabled=True, attempts=2, retry_delay_s=3)
+    cfg['gsm']['recipient'] = cfg['gsm'].get('recipient') or '(simulated phone)'  # nothing is sent
     cfg['save_images'] = True
     return cfg
 

@@ -1,5 +1,7 @@
 # Scheduled sessions update
 
+For installation, testing and deployment commands, see README_INSTRUCTION.md.
+
 Copy these files over your project, keeping the folders as they are. Every file here is new or replaces the old one.
 Files not included are unchanged: yolo_worker.py, thermal_worker.py, gsm_sms.py, preview_support.py, hub_discovery.py,
 lib/beacon.js, public/index.html, public/style.css.
@@ -15,6 +17,8 @@ lib/beacon.js, public/index.html, public/style.css.
 | public/schedule.css | new (loaded by app.js) |
 | tools/schedule_test.js | new |
 | tools/test_push.py | replaced: now a dummy prototype (see docs/SCHEDULED_SESSIONS.md); add tools/sim_data/ to .gitignore |
+| .gitignore, .gitattributes, .github/workflows/tests.yml | new: for GitHub (see README_INSTRUCTION.md section 4); hidden files, copy them too |
+| config.example.json, prototype/prototype.example.json | new: settings templates committed instead of config.json / prototype.json |
 | docs/SCHEDULED_SESSIONS.md | new |
 | docs/PROTOTYPE.md, docs/INTEGRATION.md, docs/VERIFICATION.md | updated |
 

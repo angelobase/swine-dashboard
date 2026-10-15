@@ -195,6 +195,38 @@ async function main() {
     const re = await device('PEN-02', { session: sessionMsg('pi-offline001', 'finished', { ended_at: iso(Date.now()), result: RESULT }) });
     check('deleted session not re-created', re.json.ignored === 'deleted on the dashboard', re.json);
 
+    // one prototype on two pens (the 'belongs to PEN-02' problem): blocked when adding, even with a typed address
+    const dup = await call('POST', '/api/pens', { pen_id: 'PEN-03', address: 'mqtt://other-host:1883/proto-aaa111' });
+    check('same prototype on a second pen is refused', dup.status === 409 && /already used by PEN-02/.test(dup.json.error), dup.json);
+
+    // prototype moved from PEN-02 to PEN-04 mid-session: its data stays with the session's own pen
+    check('remove PEN-02', (await call('DELETE', '/api/pens/PEN-02')).status === 200);
+    check('add the same prototype as PEN-04', (await call('POST', '/api/pens', { pen_id: 'PEN-04', address: 'mqtt://h:1883/proto-aaa111' })).status === 200);
+    const t2 = Date.now();
+    r = await device('PEN-04', { session: sessionMsg('pi-bbbb000002', 'running', { t0: t2 - 1000 }) });
+    check('moved session accepted', r.status === 200, r.json);
+    r = await device('PEN-04', { sample: sample('pi-bbbb000002', 0, t2 - 1000) });
+    check('moved session capture stored', r.status === 200 && r.json.stored === 2, r.json);
+    const runningCode = (await call('GET', '/api/sessions')).json.sessions.find((z) => z.state === 'running').session;
+    const moved = (await call('GET', '/api/log?pen=PEN-02&limit=500')).json.records.filter((x) => x.event_type === 'Measurement' && x.seq === 0 && x.session === runningCode);
+    check('capture recorded under the pen the session started on', moved.length === 2 && moved.every((x) => x.pen_id === 'PEN-02'), moved);
+
+    // a refusal arriving under another pen still closes the pending start
+    await call('POST', '/api/pens/PEN-04/session/start', {});
+    const uid3 = (await cmds('PEN-04')).find((c) => c.action === 'start').uid;
+    await device('PEN-01', { event: { kind: 'start_refused', detail: 'Session pi-bbbb000002 is still running. End it first.', uid: uid3 } });
+    check('refusal closes the start whichever pen it arrives on', !(await pen('PEN-04')).session && (await pen('PEN-04')).last_result.state === 'refused', (await pen('PEN-04')).last_result);
+
+    // a start cancelled on the dashboard that the prototype still runs is told to stop
+    await call('POST', '/api/pens/PEN-04/session/start', {});
+    const uid4 = (await cmds('PEN-04')).find((c) => c.action === 'start').uid;
+    const cancel = await call('POST', '/api/pens/PEN-04/session/end', {});
+    check('End while waiting cancels', cancel.status === 200 && !cancel.json.pending);
+    await cmds('PEN-04');
+    await device('PEN-04', { session: sessionMsg(uid4, 'running') });
+    const stop = (await cmds('PEN-04')).find((c) => c.action === 'stop');
+    check('prototype told to stop a session ended on the dashboard', stop && stop.uid === uid4, stop);
+
     // a second pen without a prototype still runs the legacy live flow
     const live = await call('POST', '/api/pens/PEN-01/session/start', {});
     check('legacy pen starts a live session', live.status === 200 && !live.json.scheduled, live.json);

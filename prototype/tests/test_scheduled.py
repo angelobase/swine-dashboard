@@ -181,7 +181,7 @@ def make(data_dir, capture, sms=None, interval=0.15, duration=0.75, rule=3, **cf
     cfg['device_id'] = 'proto-test'
     cfg['test'].update(interval_s=interval, duration_s=duration)
     cfg['screening'].update(abnormal_lying_consecutive_captures=rule)
-    cfg['gsm'].update(retry_delay_s=0)
+    cfg['gsm'].update(retry_delay_s=0, recipient='+630000000000')
     for k, v in cfg_extra.items():
         cfg[k].update(v) if isinstance(v, dict) else cfg.__setitem__(k, v)
     sent = []
@@ -286,6 +286,17 @@ class Controller(unittest.TestCase):
         q = make(self.dir, scripted_capture(lambda seq: []))
         self.assertEqual((q.sess['state'], q.sess['sms']['state']), ('finished', 'unknown'))
         self.assertEqual(q.sent, [])
+
+
+class MissingRecipient(unittest.TestCase):
+    def test_alert_without_phone_number_is_reported_not_sent(self):
+        p = make(Path(tempfile.mkdtemp()), scripted_capture(lambda seq: [PIG1_LYING_HOT]), gsm={'recipient': ''})
+        p.start_session(test=True)
+        drive(p, lambda p: p.sess['state'] == 'finished')
+        self.assertEqual(p.sess['result']['flagged'], [1])
+        self.assertEqual(p.sess['sms']['state'], 'failed')
+        self.assertIn('gsm.recipient', p.sess['sms']['detail'])
+        self.assertEqual(p.sent, [])
 
 
 class SmsRetries(unittest.TestCase):

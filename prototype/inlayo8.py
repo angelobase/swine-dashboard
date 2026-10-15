@@ -43,7 +43,7 @@ DEFAULTS = {
                 "thermal_budget_s": 8.0, "confidence": 0.93, "timeout_s": 120},
     "thermal": {"offset_c": 0.0, "calibration_file": "calibration.json"},
     "save_images": True,
-    "gsm": {"enabled": True, "recipient": "+639083082262", "port": "/dev/serial0", "attempts": 3, "retry_delay_s": 60},
+    "gsm": {"enabled": True, "recipient": "", "port": "/dev/serial0", "attempts": 3, "retry_delay_s": 60},  # recipient: set in prototype.json
 }
 MAX_FRAME_BYTES = 250_000  # the dashboard rejects frames over preview.max_frame_bytes (default 262144)
 UID_RE = re.compile(r'^[A-Za-z0-9_-]{6,40}$')
@@ -403,6 +403,8 @@ class Prototype:
             sms.update(state='skipped', detail='Test session: SMS disabled in prototype.json (test.send_sms).')
         elif not gsm.get('enabled'):
             sms.update(state='disabled', detail='SMS is disabled in prototype.json (gsm.enabled).')
+        elif not str(gsm.get('recipient', '')).strip():
+            sms.update(state='failed', detail='No SMS sent: no phone number in prototype.json (gsm.recipient).')
         else:
             message = screening.build_sms(s['pen'], result, ended, s['duration_s'], test=bool(s['test']))
             sms.update(state='sending', detail='Sending one SMS...', message=message)
@@ -567,6 +569,8 @@ def main():
     except BlockingIOError:
         raise RuntimeError('Another prototype controller is already running.')
     cfg = load_config(args.config)
+    if cfg['gsm'].get('enabled') and not str(cfg['gsm'].get('recipient', '')).strip():
+        print('WARNING: gsm.recipient is empty in prototype.json, so no SMS alert can be sent.', flush=True)
     proto = Prototype(cfg, args.model.resolve(), args.config.resolve())
     if args.abandon:
         proto.abandon()

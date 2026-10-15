@@ -1,0 +1,6 @@
+{
+  "pens": [],
+  "preview": { "enabled": true },
+  "mqtt": { "password": "change-me" },
+  "scheduled": { "overdue_grace_s": 180 }
+}
